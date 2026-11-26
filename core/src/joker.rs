@@ -435,8 +435,7 @@ impl JokerEffects for Jokers {
                 }
                 vec![Effects::OnModifyHand(Arc::new(Mutex::new(apply)))]
             }
-            Self::Photograph(photograph) => {
-                let id = photograph.instance_id;
+            Self::Photograph(_) => {
                 let apply = move |g: &mut Game, card: Card| {
                     // Retriggers of the first face card (Hanging Chad, Sock
                     // and Buskin, etc.) score it again, so Photograph fires
