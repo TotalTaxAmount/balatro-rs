@@ -1372,12 +1372,19 @@ impl Game {
             self.boss_triggered_this_hand = true;
         }
         let level = self.planetarium.play(hand.rank);
-        let (level_chips, level_mult) = if self.active_boss() == Some(BossBlind::Flint) {
-            self.boss_triggered_this_hand = true;
-            (level.chips / 2, level.mult / 2)
-        } else {
-            (level.chips, level.mult)
-        };
+        let (level_chips, level_mult) =
+            if self.active_boss() == Some(BossBlind::Psychic) && hand.all.len() < 5 {
+                // The Psychic zeroes the hand's base chips/mult when fewer than
+                // five cards are played. Card and joker contributions still
+                // resolve, which is why a Mult card can still score.
+                self.boss_triggered_this_hand = true;
+                (0, 0)
+            } else if self.active_boss() == Some(BossBlind::Flint) {
+                self.boss_triggered_this_hand = true;
+                (level.chips / 2, level.mult / 2)
+            } else {
+                (level.chips, level.mult)
+            };
         self.chips += level_chips;
         self.mult += level_mult;
         self.record_step(
@@ -3654,6 +3661,68 @@ mod tests {
         let hand = SelectHand::new(vec![ace]).best_hand().unwrap();
         g.calc_score(hand);
         assert!(g.boss_triggered_this_hand);
+    }
+
+    // --- The Psychic: fewer than five played cards score no base ---
+
+    #[test]
+    fn test_psychic_boss_zeroes_base_for_four_card_play() {
+        let mut g = Game {
+            current_boss: Some(BossBlind::Psychic),
+            blind: Some(Blind::Boss),
+            ..Default::default()
+        };
+        let hand = SelectHand::new(vec![
+            Card::new(Value::King, Suit::Heart),
+            Card::new(Value::Two, Suit::Club),
+            Card::new(Value::Seven, Suit::Spade),
+            Card::new(Value::Nine, Suit::Diamond),
+        ])
+        .best_hand()
+        .unwrap();
+        assert_eq!(g.calc_score(hand), 0);
+        assert!(g.boss_triggered_this_hand);
+    }
+
+    #[test]
+    fn test_psychic_boss_allows_five_card_play() {
+        let mut g = Game {
+            current_boss: Some(BossBlind::Psychic),
+            blind: Some(Blind::Boss),
+            ..Default::default()
+        };
+        let hand = SelectHand::new(vec![
+            Card::new(Value::King, Suit::Heart),
+            Card::new(Value::Two, Suit::Club),
+            Card::new(Value::Seven, Suit::Spade),
+            Card::new(Value::Nine, Suit::Diamond),
+            Card::new(Value::Four, Suit::Club),
+        ])
+        .best_hand()
+        .unwrap();
+        assert!(g.calc_score(hand) > 0);
+    }
+
+    #[test]
+    fn test_psychic_boss_keeps_card_and_joker_contributions() {
+        let mut g = Game {
+            current_boss: Some(BossBlind::Psychic),
+            blind: Some(Blind::Boss),
+            ..Default::default()
+        };
+        let mut king = Card::new(Value::King, Suit::Diamond);
+        king.enhancement = Some(Enhancement::Mult);
+        let hand = SelectHand::new(vec![
+            king,
+            Card::new(Value::Two, Suit::Club),
+            Card::new(Value::Seven, Suit::Spade),
+            Card::new(Value::Nine, Suit::Heart),
+        ])
+        .best_hand()
+        .unwrap();
+        // Base is zeroed, but the scored King still gives 10 chips and the
+        // Mult enhancement +4 Mult.
+        assert_eq!(g.calc_score(hand), 40);
     }
 
     // --- Group D: delevel by one (Arm) ---
