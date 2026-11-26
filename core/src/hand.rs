@@ -149,30 +149,6 @@ impl SelectHand {
             .collect()
     }
 
-    // Get map of each suit with corresponding cards.
-    // For example, Ks, Ah, Jh, Jc, Jd -> {h: [Jh, Ah], s: [Ks], c: [Jc], d: [Jd]}
-    #[allow(dead_code)]
-    pub(crate) fn suits_freq(&self) -> IndexMap<Suit, Vec<Card>> {
-        let mut counts: IndexMap<Suit, Vec<Card>> = IndexMap::new();
-        for card in self.0.clone() {
-            if card.enhancement == Some(Enhancement::Stone) {
-                continue;
-            }
-            if let Some(cards) = counts.get(&card.suit) {
-                let mut copy = cards.clone();
-                copy.push(card);
-                counts.insert(card.suit, copy);
-            } else {
-                counts.insert(card.suit, vec![card]);
-            }
-        }
-        // Return sorted by suit
-        counts
-            .into_iter()
-            .sorted_by(|a, b| Ord::cmp(&b.0, &a.0))
-            .collect()
-    }
-
     // Original relative order, values_freq()'s groups are order-preserving
     // individually, but concatenating two of them (two pair, full house)
     // isn't, without this.
@@ -596,36 +572,6 @@ mod tests {
 
         // Check ordered by value
         assert_eq!(freq.into_iter().next().unwrap().0, Value::King)
-    }
-
-    #[test]
-    fn test_suits_freq() {
-        let c1 = Card::new(Value::King, Suit::Heart);
-        let c2 = Card::new(Value::King, Suit::Spade);
-        let c3 = Card::new(Value::Two, Suit::Heart);
-        let c4 = Card::new(Value::Three, Suit::Diamond);
-        let c5 = Card::new(Value::Four, Suit::Heart);
-
-        let hand = SelectHand::new(vec![c1, c2, c3, c4, c5]);
-        let freq = hand.suits_freq();
-
-        // Should have 3 values (heart, spade, diamond)
-        assert_eq!(freq.len(), 3);
-
-        // Expect 3 hearts and 1 each of spade and diamond
-        assert_eq!(freq.get(&Suit::Heart).unwrap().len(), 3);
-        assert_eq!(freq.get(&Suit::Spade).unwrap().len(), 1);
-        assert_eq!(freq.get(&Suit::Diamond).unwrap().len(), 1);
-
-        // No clubs to be found
-        assert_eq!(freq.get(&Suit::Club), None);
-
-        // Can also check the cards in the vec are as expected
-        assert_eq!(freq.get(&Suit::Heart).unwrap()[0].suit, Suit::Heart);
-        assert_eq!(freq.get(&Suit::Heart).unwrap()[1].suit, Suit::Heart);
-        assert_eq!(freq.get(&Suit::Heart).unwrap()[2].suit, Suit::Heart);
-        assert_eq!(freq.get(&Suit::Spade).unwrap()[0].suit, Suit::Spade);
-        assert_eq!(freq.get(&Suit::Diamond).unwrap()[0].suit, Suit::Diamond);
     }
 
     #[test]

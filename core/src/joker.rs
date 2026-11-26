@@ -875,7 +875,7 @@ impl JokerEffects for Jokers {
                 // decrement it more than once.
                 vec![Effects::TriggerCountPlayed(Arc::new(Mutex::new(trigger)))]
             }
-            // --- Wave 2 Phase 2: passive / immediate scoring ---
+            // --- Passive and immediate scoring ---
             Self::Juggler(_) | Self::Drunkard(_) | Self::Troubadour(_) | Self::MerryAndy(_) => {
                 // Purely config modifiers, applied by Game::{hand_size,
                 // plays_per_round, discards_per_round}.
@@ -977,7 +977,7 @@ impl JokerEffects for Jokers {
                 vec![Effects::OnScore(Arc::new(Mutex::new(apply)))]
             }
 
-            // --- Wave 2 Phase 3: scaling and selector jokers ---
+            // --- Scaling and selector jokers ---
             Self::LoyaltyCard(loyalty) => {
                 let id = loyalty.instance_id;
                 let apply = move |g: &mut Game, _hand: MadeHand| {
@@ -1460,7 +1460,7 @@ impl JokerEffects for Jokers {
                 vec![Effects::OnScore(Arc::new(Mutex::new(apply)))]
             }
 
-            // --- Wave 2 Phase 4: round-end economy and destruction ---
+            // --- Round-end economy and destruction ---
             Self::Egg(egg) => {
                 let id = egg.instance_id;
                 let grow = move |g: &mut Game, event: GameEvent| {
@@ -1672,7 +1672,7 @@ impl JokerEffects for Jokers {
                 ]
             }
 
-            // --- Wave 2 Phase 5: blind selection, deck, and card creation ---
+            // --- Blind selection, deck, and card creation ---
             Self::CeremonialDagger(ceremonial) => {
                 let id = ceremonial.instance_id;
                 let apply = move |g: &mut Game, event: GameEvent| {
@@ -1973,7 +1973,7 @@ impl JokerEffects for Jokers {
                 ]
             }
 
-            // --- Wave 2 Phase 6: shop / macro jokers ---
+            // --- Shop and macro jokers ---
             Self::CreditCard(_)
             | Self::ChaosTheClown(_)
             | Self::Astronomer(_)

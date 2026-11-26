@@ -53,8 +53,7 @@ pub(crate) trait RngBackend {
     /// its own active-voucher list, so it has to be told. No-op for
     /// `Fast` mode, which reads `ShopContext::vouchers` per call instead.
     fn on_voucher_bought(&mut self, voucher: &Voucher);
-    /// Jokers::Showman's real effect. No call site yet — see `jokers.md`.
-    #[allow(dead_code)]
+    /// Jokers::Showman's real effect: allow owned jokers to appear again.
     fn set_showman(&mut self, owned: bool);
 
     /// A single freshly generated joker, outside the shop/pack context —

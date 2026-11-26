@@ -20,6 +20,8 @@ pub mod game;
 pub mod generator;
 pub mod hand;
 pub mod joker;
+#[cfg(test)]
+mod joker_tests;
 pub mod pack;
 pub mod planet;
 pub mod rank;
@@ -34,8 +36,6 @@ pub mod stage;
 pub mod tag;
 pub mod tarot;
 pub mod voucher;
-#[cfg(test)]
-mod wave2_tests;
 
 #[cfg(test)]
 mod tests {

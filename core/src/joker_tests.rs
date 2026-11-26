@@ -1,4 +1,4 @@
-//! Wave 2 joker coverage tests.
+//! Joker effect coverage tests.
 
 use std::collections::HashSet;
 
@@ -28,7 +28,7 @@ fn card(value: Value, suit: Suit) -> Card {
     Card::new(value, suit)
 }
 
-// --- Phase 2 -----------------------------------------------------------
+// --- Passive and config jokers -----------------------------------------
 
 #[test]
 fn juggler_adds_hand_size() {
@@ -209,7 +209,7 @@ fn throwback_scales_with_skips() {
     assert_eq!(score(&mut g, vec![ace]), 32);
 }
 
-// --- Phase 3 -----------------------------------------------------------
+// --- Scaling and selector jokers ---------------------------------------
 
 #[test]
 fn runner_gains_and_applies_same_hand() {
@@ -489,7 +489,7 @@ fn loyalty_card_counts_down_and_pays() {
     assert_eq!(g.joker_state_mut(1).unwrap().counter, 5.0);
 }
 
-// --- Phase 4 -----------------------------------------------------------
+// --- Round-end economy and destruction -------------------------------
 
 #[test]
 fn egg_grows_sell_value_at_round_end() {
@@ -620,7 +620,7 @@ fn invisible_joker_duplicates_after_two_rounds() {
     assert_eq!(g.jokers.len(), before);
 }
 
-// --- Phase 5 -----------------------------------------------------------
+// --- Blind selection, deck, and card creation -------------------------
 
 #[test]
 fn ceremonial_dagger_eats_right_neighbor() {
@@ -843,7 +843,7 @@ fn madness_gains_and_destroys_a_joker() {
     assert_eq!(g.jokers.len(), 1);
 }
 
-// --- Phase 6 -----------------------------------------------------------
+// --- Shop and macro jokers ---------------------------------------------
 
 #[test]
 fn credit_card_allows_debt_up_to_twenty() {

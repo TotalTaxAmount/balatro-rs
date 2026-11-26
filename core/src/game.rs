@@ -176,7 +176,7 @@ pub struct Game {
     #[cfg_attr(feature = "serde", serde(default))]
     pub(crate) boss_triggered_this_hand: bool,
 
-    // --- Wave 2 run statistics / lifecycle tracking ---
+    // --- Run statistics / lifecycle tracking ---
     #[cfg_attr(feature = "serde", serde(default))]
     pub total_hands_played: usize,
     #[cfg_attr(feature = "serde", serde(default))]
