@@ -12,6 +12,11 @@ impl Deck {
     pub fn new() -> Self {
         Self { cards: Vec::new() }
     }
+
+    /// Build a deck from external state (for example a live game observation).
+    pub fn from_cards(cards: Vec<Card>) -> Self {
+        Self { cards }
+    }
     pub(crate) fn draw(&mut self, n: usize) -> Vec<Card> {
         let n = n.min(self.cards.len());
         self.cards.drain(0..n).collect()

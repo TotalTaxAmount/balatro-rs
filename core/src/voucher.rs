@@ -19,6 +19,11 @@ impl Vouchers {
         Self::default()
     }
 
+    /// Build the redeemed-voucher set from external state.
+    pub fn from_owned(owned: Vec<Voucher>) -> Self {
+        Self { owned }
+    }
+
     pub fn has(&self, voucher: Voucher) -> bool {
         self.owned.contains(&voucher)
     }

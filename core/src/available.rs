@@ -26,6 +26,12 @@ pub struct Available {
 }
 
 impl Available {
+    /// Build an available area from external state (for example a live game
+    /// observation), preserving each card's selected flag.
+    pub fn from_cards(cards: Vec<(Card, bool)>) -> Self {
+        Self { cards }
+    }
+
     pub(crate) fn select_card(&mut self, card: Card) -> Result<(), GameError> {
         if let Some((i, _)) = self.cards.iter().find_position(|(c, _a)| c.id == card.id) {
             self.cards[i].1 = true;

@@ -87,6 +87,11 @@ pub struct Game {
     pub mult: usize,
     pub score: usize,
     pub prob_mult: u32,
+    /// When set, `required_score` returns this instead of deriving the target
+    /// from the ante table. Used when mirroring a live game, where the client
+    /// is the authority on the current blind's target.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub required_score_override: Option<usize>,
 
     // shared game-level history some jokers key off (RideTheBus, Obelisk, etc)
     #[cfg_attr(feature = "serde", serde(default))]
@@ -190,6 +195,7 @@ impl Game {
             mult: config.base_mult,
             score: config.base_score,
             prob_mult: 1,
+            required_score_override: None,
             hand_ranks_played_this_round: HashSet::new(),
             consecutive_hands_without_face_card: 0,
             consecutive_hands_not_most_played_type: 0,
@@ -879,6 +885,9 @@ impl Game {
     }
 
     pub fn required_score(&self) -> usize {
+        if let Some(score) = self.required_score_override {
+            return score;
+        }
         let base = self.ante_current.base();
         match self.blind {
             None => base,
@@ -892,6 +901,32 @@ impl Game {
     /// `current_boss`, valid before boss blind is active.
     pub fn boss_required_score(&self) -> usize {
         self.ante_current.base() * Self::boss_score_multiplier(self.current_boss)
+    }
+
+    /// --- Live-observation setters -------------------------------------
+    //
+    // These counters are normally derived from action history. When mirroring
+    // a live game we only have the client's current values, so allow the
+    // adapter to set them directly.
+
+    pub fn set_hand_ranks_played_this_round(&mut self, ranks: HashSet<HandRank>) {
+        self.hand_ranks_played_this_round = ranks;
+    }
+
+    pub fn set_consecutive_hands_without_face_card(&mut self, count: usize) {
+        self.consecutive_hands_without_face_card = count;
+    }
+
+    pub fn set_consecutive_hands_not_most_played_type(&mut self, count: usize) {
+        self.consecutive_hands_not_most_played_type = count;
+    }
+
+    pub fn set_discarded_this_round(&mut self, cards: Vec<Card>) {
+        self.discarded_this_round = cards;
+    }
+
+    pub fn set_total_cards_discarded(&mut self, count: usize) {
+        self.total_cards_discarded = count;
     }
 
     fn boss_score_multiplier(boss: Option<BossBlind>) -> usize {
