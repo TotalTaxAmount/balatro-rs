@@ -438,10 +438,10 @@ impl JokerEffects for Jokers {
             Self::Photograph(photograph) => {
                 let id = photograph.instance_id;
                 let apply = move |g: &mut Game, card: Card| {
-                    if Some(card.id) == g.first_face_id
-                        && g.is_face_card(&card)
-                        && g.card_scored_jokers.insert(id)
-                    {
+                    // Retriggers of the first face card (Hanging Chad, Sock
+                    // and Buskin, etc.) score it again, so Photograph fires
+                    // again for each retrigger.
+                    if Some(card.id) == g.first_face_id && g.is_face_card(&card) {
                         g.multiply_mult(2.0);
                     }
                 };

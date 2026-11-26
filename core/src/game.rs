@@ -224,9 +224,6 @@ pub struct Game {
     /// First face card scored this hand (for Photograph).
     #[cfg_attr(feature = "serde", serde(skip))]
     pub(crate) first_face_id: Option<usize>,
-    /// Jokers whose once-per-hand card trigger already fired.
-    #[cfg_attr(feature = "serde", serde(skip))]
-    pub(crate) card_scored_jokers: HashSet<usize>,
 
     pub last_consumable_used: Option<Consumable>,
     #[cfg_attr(feature = "serde", serde(default))]
@@ -362,7 +359,6 @@ impl Game {
             emitting: false,
             event_queue: Vec::new(),
             first_face_id: None,
-            card_scored_jokers: HashSet::new(),
             last_consumable_used: None,
             last_score: 0,
             reroll_cost: default_reroll_cost(),
@@ -1363,7 +1359,6 @@ impl Game {
     ) -> usize {
         self.boss_triggered_this_hand = false;
         self.first_face_id = None;
-        self.card_scored_jokers.clear();
 
         // Space Joker upgrades the hand before its base chips/mult are read.
         self.emit(GameEvent::BeforeScore(hand.rank));

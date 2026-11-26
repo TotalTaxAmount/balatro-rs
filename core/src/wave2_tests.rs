@@ -992,3 +992,17 @@ fn smiley_before_photograph_is_better_than_reversed() {
     assert_eq!(score(&mut left, vec![king]), 180);
     assert_eq!(score(&mut right, vec![king]), 105);
 }
+
+#[test]
+fn photograph_retriggers_on_hanging_chad() {
+    let mut g = Game::default();
+    add(&mut g, Jokers::Photograph(Photograph::default()));
+    add(&mut g, Jokers::HangingChad(HangingChad::default()));
+    register(&mut g);
+
+    let king = card(Value::King, Suit::Heart);
+    // High Card base 5 + K10 per trigger: Hanging Chad scores it 3 times
+    // (5 + 10*3 = 35 chips). Photograph doubles each time: 1 -> 2 -> 4 -> 8.
+    // 35 * 8 = 280.
+    assert_eq!(score(&mut g, vec![king]), 280);
+}
