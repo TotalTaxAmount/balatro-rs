@@ -740,6 +740,7 @@ impl Game {
         // influence how many call sites are reached.
         let mut counter = self.clone();
         counter.available = available.clone();
+        counter.plays = self.plays.saturating_sub(1);
         counter.prob_mode = ProbMode::Count;
         counter.prob_trace.clear();
         let _ = counter.calc_score(made.clone());
@@ -748,6 +749,7 @@ impl Game {
         if triggers.is_empty() {
             let mut game = self.clone();
             game.available = available;
+            game.plays = self.plays.saturating_sub(1);
             game.prob_mode = ProbMode::Sampled;
             let score = game.calc_score(made);
             let money_delta = game.money as i64 - self.money as i64;
@@ -775,6 +777,7 @@ impl Game {
             for mask in 0..(1u64 << triggers.len()) {
                 let mut game = self.clone();
                 game.available = available.clone();
+                game.plays = self.plays.saturating_sub(1);
                 game.prob_mode = ProbMode::Scripted;
                 game.prob_script = (0..triggers.len())
                     .map(|index| (mask >> index) & 1 == 1)
@@ -826,6 +829,7 @@ impl Game {
         for sample in 0..SAMPLES {
             let mut game = self.clone();
             game.available = available.clone();
+            game.plays = self.plays.saturating_sub(1);
             game.prob_mode = ProbMode::Scripted;
             game.prob_script = triggers
                 .iter()
@@ -985,6 +989,14 @@ impl Game {
             .find(|c| hand_ids.contains(&c.id) || c.enhancement == Some(Enhancement::Stone))
             .map(|c| c.id);
 
+        // Hand modifiers (e.g. Midas Mask) must run before the scored cards so
+        // an overwritten enhancement (Bonus -> Gold) is reflected in this hand.
+        for e in self.effect_registry.on_modify_hand.clone() {
+            if let Effects::OnModifyHand(f) = e {
+                f.lock().unwrap()(self, &mut hand)
+            }
+        }
+
         // per-scored-card, rank chips, enhancements, editions
         for card in hand.hand.cards() {
             if self.is_card_debuffed(&card) {
@@ -1094,13 +1106,6 @@ impl Game {
                     mult_before,
                     trig > 0,
                 );
-            }
-        }
-
-        // run hand modifiers (e.g. Pareidolia) before joker scoring effects
-        for e in self.effect_registry.on_modify_hand.clone() {
-            if let Effects::OnModifyHand(f) = e {
-                f.lock().unwrap()(self, &mut hand)
             }
         }
 
@@ -3383,6 +3388,63 @@ mod tests {
         // (5 + 11 + 50) chips * 1.5 = 99; Gold seal pays $3.
         assert_eq!(g.calc_score(hand), 99);
         assert_eq!(g.money, 3);
+    }
+
+    #[test]
+    fn test_calc_score_pure_consumes_a_hand_for_final_hand_effects() {
+        let card = Card::new(Value::Ace, Suit::Heart);
+        let mut game = Game::default();
+        game.plays = 1;
+        game.jokers = vec![Jokers::Dusk(crate::joker::Dusk::default())];
+        game.effect_registry
+            .register_jokers(game.jokers.clone(), &game.clone());
+        game.available = Available::from_cards(vec![(card, false)]);
+
+        let evaluation = game.calc_score_pure(&[card]).expect("legal play");
+        // Dusk retriggers the final hand: (5 + 11 + 11) * 1 = 27.
+        assert_eq!(evaluation.score, 27.0);
+
+        // With another hand left, Dusk does not fire: (5 + 11) * 1 = 16.
+        let mut not_final = game.clone();
+        not_final.plays = 2;
+        let evaluation = not_final.calc_score_pure(&[card]).expect("legal play");
+        assert_eq!(evaluation.score, 16.0);
+    }
+
+    #[test]
+    fn test_midas_mask_overwrites_bonus_before_scoring() {
+        let mut g = Game::default();
+        g.jokers = vec![Jokers::MidasMask(crate::joker::MidasMask::default())];
+        g.effect_registry
+            .register_jokers(g.jokers.clone(), &g.clone());
+
+        let mut cards = Vec::new();
+        for suit in [Suit::Heart, Suit::Diamond, Suit::Club] {
+            let mut card = Card::new(Value::King, suit);
+            card.enhancement = Some(Enhancement::Bonus);
+            cards.push(card);
+        }
+        let hand = SelectHand::new(cards).best_hand().unwrap();
+
+        // Midas turns the scored Kings Gold before scoring, so the +30 Bonus
+        // is overwritten. Trips: 30 base + 30 card chips = 60 chips, 3 mult.
+        assert_eq!(g.calc_score(hand), 180);
+    }
+
+    #[test]
+    fn test_joker_stencil_counts_its_own_slot() {
+        let card = Card::new(Value::Ace, Suit::Heart);
+        let hand = SelectHand::new(vec![card]).best_hand().unwrap();
+
+        let mut g = Game::default();
+        g.jokers = vec![Jokers::JokerStencil(
+            crate::joker::JokerStencil::default(),
+        )];
+        g.effect_registry
+            .register_jokers(g.jokers.clone(), &g.clone());
+
+        // 5 slots, 1 Stencil -> 4 empty + its own slot = X5. (5 + 11) * 5 = 80.
+        assert_eq!(g.calc_score(hand), 80);
     }
 
     #[test]

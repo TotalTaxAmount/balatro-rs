@@ -206,10 +206,10 @@ impl JokerEffects for Jokers {
             }
             Self::JokerStencil(_) => {
                 fn apply(g: &mut Game, _hand: MadeHand) {
-                    let empty = g.joker_slots().saturating_sub(g.jokers.len());
-                    if empty > 0 {
-                        g.multiply_mult(empty as f64);
-                    }
+                    // Stencil counts its own slot as empty ("Joker Stencil
+                    // included"), so 1 Stencil in 5 slots gives X5.
+                    let empty = g.joker_slots().saturating_sub(g.jokers.len()) + 1;
+                    g.multiply_mult(empty as f64);
                 }
                 vec![Effects::OnScore(Arc::new(Mutex::new(apply)))]
             }
@@ -1752,25 +1752,25 @@ mod tests {
         };
         assert_eq!(g.calc_score(best.clone()), 16);
 
-        // Stencil alone in 5 slots = 4 empty -> X4
-        // (5 + 11) * (1 * 4) = 64
+        // Stencil alone in 5 slots = 4 empty + its own slot -> X5
+        // (5 + 11) * 5 = 80
         let j = Jokers::JokerStencil(JokerStencil::default());
         g.money += 1000;
         g.stage = Stage::Shop();
         g.shop.jokers.push(j.clone());
         g.buy_joker(j).unwrap();
         g.stage = Stage::Blind(Blind::Small);
-        assert_eq!(g.calc_score(best.clone()), 64);
+        assert_eq!(g.calc_score(best.clone()), 80);
 
-        // Add another joker -> 3 empty -> X3
+        // Add another joker -> 3 empty + its own slot -> X4
         let j2 = Jokers::Banner(Banner::default());
         g.money += 1000;
         g.stage = Stage::Shop();
         g.shop.jokers.push(j2.clone());
         g.buy_joker(j2).unwrap();
         g.stage = Stage::Blind(Blind::Small);
-        // (5 + 11 + 4*30) * (1 * 3) = 136 * 3 = 408
-        assert_eq!(g.calc_score(best.clone()), 408);
+        // (5 + 11 + 4*30) * 4 = 136 * 4 = 544
+        assert_eq!(g.calc_score(best.clone()), 544);
     }
 
     #[test]
