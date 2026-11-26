@@ -933,3 +933,25 @@ fn trading_card_destroys_without_replacement_draw() {
     assert_eq!(g.money, money_before + 3);
     assert_eq!(g.discards_remaining, 3);
 }
+
+#[test]
+fn castle_accumulates_chips_per_discarded_suit_card() {
+    let mut g = Game::default();
+    add(&mut g, Jokers::Castle(Castle::default()));
+    register(&mut g);
+    g.joker_state_mut(1).unwrap().selector = Some(SelectorValue::Suit(Suit::Heart));
+    g.joker_state_mut(1).unwrap().aux = 3.0;
+    g.emit(GameEvent::Discard {
+        rank: HandRank::HighCard,
+        discarded: vec![
+            card(Value::Two, Suit::Heart),
+            card(Value::Three, Suit::Heart),
+            card(Value::Four, Suit::Spade),
+        ],
+        first: true,
+    });
+    assert_eq!(g.joker_state_mut(1).unwrap().counter, 6.0);
+    let ace = card(Value::Ace, Suit::Heart);
+    // High Card (5 + 11) + 6 Castle chips = 22.
+    assert_eq!(score(&mut g, vec![ace]), 22);
+}

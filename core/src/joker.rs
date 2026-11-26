@@ -407,8 +407,9 @@ impl JokerEffects for Jokers {
                 vec![Effects::OnScore(Arc::new(Mutex::new(apply)))]
             }
             Self::FacelessJoker(_) => {
-                fn apply(g: &mut Game, _hand: MadeHand) {
-                    if _hand.all.len() >= 5 {
+                fn apply(g: &mut Game, hand: MadeHand) {
+                    let faces = hand.all.iter().filter(|card| g.is_face_card(card)).count();
+                    if faces >= 3 {
                         g.money += 5;
                     }
                 }
@@ -782,24 +783,47 @@ impl JokerEffects for Jokers {
                 vec![Effects::OnScore(Arc::new(Mutex::new(apply)))]
             }
             Self::Castle(castle) => {
-                // Selector is picked in Game::clear_blind (round-scoped, "changes
-                // every round"), *after* effects() is typically last rebuilt
-                // (buy/sell/pack-add), must be looked up live.
+                // The client stores accumulated chips in `extra.chips`; the
+                // gain is permanent, not recomputed from this round's discard
+                // pile.
                 let id = castle.instance_id;
-                let apply = move |g: &mut Game, _hand: MadeHand| {
-                    let Some(SelectorValue::Suit(suit)) =
-                        g.joker_state_mut(id).and_then(|s| s.selector)
+                let gain = move |g: &mut Game, event: GameEvent| {
+                    let GameEvent::Discard { discarded, .. } = event else {
+                        return;
+                    };
+                    let Some(state) = g
+                        .jokers
+                        .iter()
+                        .find(|j| j.instance_id() == id)
+                        .map(|j| j.state())
                     else {
                         return;
                     };
-                    let count = g
-                        .non_debuffed(g.discarded_this_round.iter())
+                    let Some(SelectorValue::Suit(suit)) = state.selector else {
+                        return;
+                    };
+                    let count = discarded
                         .iter()
-                        .filter(|c| g.matches_suit(*c, suit))
+                        .filter(|card| g.matches_suit(card, suit))
                         .count();
-                    g.chips += count * 3;
+                    let step = if state.aux > 0.0 { state.aux } else { 3.0 };
+                    if let Some(slot) = g.joker_state_mut(id) {
+                        slot.counter += step * count as f32;
+                    }
                 };
-                vec![Effects::OnScore(Arc::new(Mutex::new(apply)))]
+                let score = move |g: &mut Game, _hand: MadeHand| {
+                    let chips = g
+                        .jokers
+                        .iter()
+                        .find(|j| j.instance_id() == id)
+                        .map(|j| j.state().counter.max(0.0) as usize)
+                        .unwrap_or(0);
+                    g.chips += chips;
+                };
+                vec![
+                    Effects::OnEvent(Arc::new(Mutex::new(gain))),
+                    Effects::OnScore(Arc::new(Mutex::new(score))),
+                ]
             }
             Self::MailInRebate(mail) => {
                 // Immediate payout on the triggering discard itself, not an
@@ -870,7 +894,10 @@ impl JokerEffects for Jokers {
                 vec![Effects::OnScore(Arc::new(Mutex::new(apply)))]
             }
             Self::TurtleBean(_) => {
-                fn apply(g: &mut Game, _event: GameEvent) {
+                fn apply(g: &mut Game, event: GameEvent) {
+                    if !matches!(event, GameEvent::RoundEnd) {
+                        return;
+                    }
                     for joker in g.jokers.clone() {
                         if matches!(joker, Jokers::TurtleBean(_)) {
                             if let Some(state) = g.joker_state_mut(joker.instance_id()) {
@@ -3576,54 +3603,53 @@ mod tests {
 
     #[test]
     fn test_faceless_joker() {
-        let j = Jokers::FacelessJoker(FacelessJoker::default());
-
         let mut g = Game::default();
-        g.start();
         g.stage = Stage::Blind(Blind::Small);
         g.blind = Some(Blind::Small);
-        g.deal();
+        g.jokers
+            .push(Jokers::FacelessJoker(FacelessJoker::default()));
+        g.register_jokers();
 
-        g.money += 1000;
-        g.stage = Stage::Shop();
-        g.shop.jokers.push(j.clone());
-        g.buy_joker(j).unwrap();
-        g.stage = Stage::Blind(Blind::Small);
-
-        let cards: Vec<Card> = g.available.cards().iter().take(5).copied().collect();
-        for card in &cards {
+        let cards = [
+            Card::new(Value::King, Suit::Heart),
+            Card::new(Value::Queen, Suit::Diamond),
+            Card::new(Value::Jack, Suit::Club),
+            Card::new(Value::Two, Suit::Spade),
+        ];
+        g.available = crate::available::Available::from_cards(
+            cards.iter().map(|card| (*card, false)).collect(),
+        );
+        for card in &cards[..3] {
             g.available.select_card(*card).expect("can select");
         }
-        assert_eq!(g.available.selected().len(), 5);
-
+        let before = g.money;
         g.discard_selected().expect("can discard");
-        assert_eq!(g.money, 1001);
+        assert_eq!(g.money, before + 5);
     }
 
     #[test]
     fn test_faceless_joker_few_cards() {
-        let j = Jokers::FacelessJoker(FacelessJoker::default());
-
         let mut g = Game::default();
-        g.start();
         g.stage = Stage::Blind(Blind::Small);
         g.blind = Some(Blind::Small);
-        g.deal();
+        g.jokers
+            .push(Jokers::FacelessJoker(FacelessJoker::default()));
+        g.register_jokers();
 
-        g.money += 1000;
-        g.stage = Stage::Shop();
-        g.shop.jokers.push(j.clone());
-        g.buy_joker(j).unwrap();
-        g.stage = Stage::Blind(Blind::Small);
-
-        let cards: Vec<Card> = g.available.cards().iter().take(3).copied().collect();
+        let cards = [
+            Card::new(Value::King, Suit::Heart),
+            Card::new(Value::Queen, Suit::Diamond),
+            Card::new(Value::Two, Suit::Spade),
+        ];
+        g.available = crate::available::Available::from_cards(
+            cards.iter().map(|card| (*card, false)).collect(),
+        );
         for card in &cards {
             g.available.select_card(*card).expect("can select");
         }
-        assert_eq!(g.available.selected().len(), 3);
-
+        let before = g.money;
         g.discard_selected().expect("can discard");
-        assert_eq!(g.money, 996);
+        assert_eq!(g.money, before);
     }
 
     #[test]

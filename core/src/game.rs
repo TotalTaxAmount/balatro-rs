@@ -247,6 +247,21 @@ pub struct Game {
     pub open_pack: Option<OpenPackState>,
 }
 
+/// Actions the live bot can take, replayable against the simulator for
+/// differential state comparison.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LiveAction {
+    SelectNextBlind,
+    Play(Vec<usize>),
+    Discard(Vec<usize>),
+    CashOut,
+    NextRound,
+    SellJoker(usize),
+    UseConsumable(usize),
+    Reroll,
+    SkipPack,
+}
+
 impl Game {
     pub fn new(config: Config) -> Self {
         let ante_start = Ante::try_from(config.ante_start).unwrap_or(Ante::One);
@@ -590,7 +605,15 @@ impl Game {
 
     // draw from deck to available
     fn draw(&mut self, count: usize) {
-        self.available.extend(self.deck.draw(count));
+        // Normal draws never exceed hand size. Serpent explicitly forces
+        // three cards after every play/discard, even above the limit.
+        let limit = if self.active_boss() == Some(BossBlind::Serpent) {
+            usize::MAX
+        } else {
+            self.hand_size()
+        };
+        let room = limit.saturating_sub(self.available.cards().len());
+        self.available.extend(self.deck.draw(count.min(room)));
     }
 
     /// Vanilla Balatro does not reshuffle the discard pile mid-round. If the
@@ -2348,6 +2371,52 @@ impl Game {
         Ok(true)
     }
 
+    fn select_ids(&mut self, ids: &[usize]) -> Result<(), GameError> {
+        let hand = self.available.cards();
+        let existing: HashSet<usize> = hand.iter().map(|card| card.id).collect();
+        if ids.iter().any(|id| !existing.contains(id)) {
+            return Err(GameError::InvalidAction);
+        }
+        let selected: HashSet<usize> = ids.iter().copied().collect();
+        self.available = Available::from_cards(
+            hand.into_iter()
+                .map(|card| (card, selected.contains(&card.id)))
+                .collect(),
+        );
+        Ok(())
+    }
+
+    /// Replay an action taken in the live client. Card ids are the parsed
+    /// client ids, so both games must have been built from the same state.
+    pub fn apply_live_action(&mut self, action: LiveAction) -> Result<(), GameError> {
+        match action {
+            LiveAction::SelectNextBlind => {
+                let next = self.blind.map(|blind| blind.next()).unwrap_or(Blind::Small);
+                self.select_blind(next)
+            }
+            LiveAction::Play(ids) => {
+                self.select_ids(&ids)?;
+                self.play_selected()
+            }
+            LiveAction::Discard(ids) => {
+                self.select_ids(&ids)?;
+                self.discard_selected()
+            }
+            LiveAction::CashOut => self.cashout(),
+            LiveAction::NextRound => self.next_round(),
+            LiveAction::SellJoker(index) => self.sell_joker(index),
+            LiveAction::UseConsumable(index) => {
+                let consumable = *self
+                    .consumables
+                    .get(index)
+                    .ok_or(GameError::InvalidAction)?;
+                self.use_consumable(consumable)
+            }
+            LiveAction::Reroll => self.reroll(),
+            LiveAction::SkipPack => self.skip_pack(),
+        }
+    }
+
     pub fn handle_action(&mut self, action: Action) -> Result<(), GameError> {
         self.action_history.push(action.clone());
         match action {
@@ -2602,6 +2671,7 @@ fn initialize_new_joker(joker: &mut Jokers) {
             state.counter = 5.0;
             state.aux = 1.0;
         }
+        Jokers::Castle(_) => state.aux = 3.0,
         Jokers::AncientJoker(_) => state.aux = 1.5,
         Jokers::TheIdol(_) => state.aux = 2.0,
         Jokers::ToDoList(_) => state.counter = 4.0,
