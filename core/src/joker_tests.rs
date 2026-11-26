@@ -1162,3 +1162,26 @@ fn baron_is_retriggered_by_mime_and_red_seal() {
     // A red seal also retriggers Baron: 1.5^2.
     assert_eq!(score(&mut g, vec![played]), 15);
 }
+
+#[test]
+fn vampire_consumes_stone_and_scores_the_stripped_rank() {
+    let ace = card(Value::Ace, Suit::Heart);
+    let mut stone = card(Value::Two, Suit::Heart);
+    stone.enhancement = Some(Enhancement::Stone);
+
+    let mut vampire = Jokers::Vampire(Vampire::default());
+    vampire.set_instance_id(1);
+    let mut state = vampire.state();
+    state.counter = 1.0;
+    state.aux = 0.1;
+    vampire.set_state(state);
+
+    let mut g = Game::default();
+    g.stage = Stage::Blind(Blind::Small);
+    g.jokers = vec![vampire];
+    g.register_jokers();
+
+    // High card A plus the stripped Stone's 2: (5 + 11 + 2) * 1.1 = 19.8.
+    assert_eq!(score(&mut g, vec![ace, stone]), 19);
+    assert!((g.joker_state_mut(1).unwrap().counter - 1.1).abs() < 1e-6);
+}

@@ -1215,30 +1215,41 @@ impl JokerEffects for Jokers {
                 let id = vampire.instance_id;
                 let modify = move |g: &mut Game, hand: &mut MadeHand| {
                     // The client strips enhancements before the scored card
-                    // pass, so the Bonus/etc. does not score this hand.
+                    // pass, so the Bonus/etc. does not score this hand. Stone
+                    // cards are scored by the kicker pass rather than
+                    // `scored_cards`, but Vampire still consumes them.
                     let scored_ids: HashSet<usize> = hand
                         .scored_cards(g.has_splash())
                         .iter()
                         .map(|card| card.id)
                         .collect();
-                    let enhanced = hand
-                        .all
-                        .iter()
-                        .filter(|card| scored_ids.contains(&card.id) && card.enhancement.is_some())
-                        .count();
+                    let consumed = |card: &Card| {
+                        card.enhancement.is_some()
+                            && (scored_ids.contains(&card.id)
+                                || card.enhancement == Some(Enhancement::Stone))
+                    };
+                    let enhanced = hand.all.iter().filter(|card| consumed(card)).count();
                     if enhanced > 0 {
                         if let Some(state) = g.joker_state_mut(id) {
                             state.counter += state.aux.max(0.0) * enhanced as f32;
                         }
                     }
+                    let mut stripped_stones: Vec<usize> = Vec::new();
                     for card in hand.all.iter_mut() {
-                        if scored_ids.contains(&card.id) && card.enhancement.is_some() {
+                        if consumed(card) {
+                            if card.enhancement == Some(Enhancement::Stone) {
+                                stripped_stones.push(card.id);
+                            }
                             card.enhancement = None;
                             g.mutate_card(card.id, |c| c.enhancement = None);
                         }
                     }
-                    let made_ids: HashSet<usize> =
+                    // A Stone card still scores after its enhancement is
+                    // stripped; it becomes a normal card and contributes its
+                    // rank chips instead of the Stone +50.
+                    let mut made_ids: HashSet<usize> =
                         hand.hand.cards().iter().map(|card| card.id).collect();
+                    made_ids.extend(stripped_stones);
                     let made: Vec<Card> = hand
                         .all
                         .iter()
