@@ -461,17 +461,9 @@ impl JokerEffects for Jokers {
                 }
                 vec![Effects::OnModifyHand(Arc::new(Mutex::new(apply)))]
             }
-            Self::Photograph(_) => {
-                fn apply(g: &mut Game, _hand: MadeHand) {
-                    for card in g.non_debuffed(_hand.scored_cards(g.has_splash()).iter()) {
-                        if g.is_face_card(&card) {
-                            g.multiply_mult(2.0);
-                            break;
-                        }
-                    }
-                }
-                vec![Effects::OnScore(Arc::new(Mutex::new(apply)))]
-            }
+            // Photograph's X2 is applied by the card-scoring pass on the first
+            // face card (see Game::calc_score_inner), not in joker order.
+            Self::Photograph(_) => vec![],
             Self::ReservedParking(_) => {
                 fn apply(g: &mut Game, _hand: MadeHand) {
                     for card in g.non_debuffed(g.available.not_selected().iter()) {

@@ -1433,6 +1433,16 @@ impl Game {
                 .map(|c| c.id)
         };
 
+        // Photograph triggers on the first face card scored, during the
+        // card-scoring pass, so additive jokers later in the order still count
+        // once before its X2.
+        let photograph_count = self
+            .jokers
+            .iter()
+            .filter(|joker| matches!(joker, Jokers::Photograph(_)))
+            .count();
+        let mut photograph_triggered = false;
+
         // per-scored-card, rank chips, enhancements, editions
         for card in scoring_cards {
             if self.is_card_debuffed(&card) {
@@ -1485,6 +1495,12 @@ impl Game {
                     mult_before,
                     trig > 0,
                 );
+            }
+            if !photograph_triggered && photograph_count > 0 && self.is_face_card(&card) {
+                for _ in 0..photograph_count {
+                    self.multiply_mult(2.0);
+                }
+                photograph_triggered = true;
             }
         }
 

@@ -955,3 +955,20 @@ fn castle_accumulates_chips_per_discarded_suit_card() {
     // High Card (5 + 11) + 6 Castle chips = 22.
     assert_eq!(score(&mut g, vec![ace]), 22);
 }
+
+#[test]
+fn photograph_doubles_before_additive_jokers() {
+    let mut g = Game::default();
+    add(&mut g, Jokers::Popcorn(Popcorn::default()));
+    add(&mut g, Jokers::AbstractJoker(AbstractJoker::default()));
+    add(&mut g, Jokers::Photograph(Photograph::default()));
+    add(&mut g, Jokers::Mime(Mime::default()));
+    add(&mut g, Jokers::SteelJoker(SteelJoker::default()));
+    register(&mut g);
+    g.joker_state_mut(1).unwrap().counter = 8.0;
+
+    let jack = card(Value::Jack, Suit::Heart);
+    // High Card J: 5 + 10 = 15 chips.
+    // Photograph X2 first (1 -> 2), Popcorn +8 (-> 10), Abstract +15 (-> 25).
+    assert_eq!(score(&mut g, vec![jack]), 15 * 25);
+}
