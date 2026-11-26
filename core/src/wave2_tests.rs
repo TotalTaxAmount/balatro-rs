@@ -1006,3 +1006,26 @@ fn photograph_retriggers_on_hanging_chad() {
     // 35 * 8 = 280.
     assert_eq!(score(&mut g, vec![king]), 280);
 }
+
+#[test]
+fn green_joker_gains_before_scoring_and_loses_on_discard() {
+    let mut g = Game::default();
+    add(&mut g, Jokers::GreenJoker(GreenJoker::default()));
+    register(&mut g);
+    g.joker_state_mut(1).unwrap().aux = 1.0;
+
+    let ace = card(Value::Ace, Suit::Heart);
+    // Fresh Green: gain +1 before scoring, so (5 + 11) * (1 + 1) = 32.
+    assert_eq!(score(&mut g, vec![ace]), 32);
+    assert_eq!(g.joker_state_mut(1).unwrap().counter, 1.0);
+
+    g.emit(GameEvent::Discard {
+        rank: HandRank::HighCard,
+        discarded: vec![card(Value::Two, Suit::Spade)],
+        first: true,
+    });
+    assert_eq!(g.joker_state_mut(1).unwrap().counter, 0.0);
+
+    assert_eq!(score(&mut g, vec![ace]), 32);
+    assert_eq!(g.joker_state_mut(1).unwrap().counter, 1.0);
+}

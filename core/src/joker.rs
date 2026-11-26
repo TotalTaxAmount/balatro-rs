@@ -713,16 +713,50 @@ impl JokerEffects for Jokers {
                 }
                 vec![Effects::OnDiscard(Arc::new(Mutex::new(apply)))]
             }
-            Self::GreenJoker(_) => {
-                // config.plays/config.discards - remaining == used this
-                // round, both already reset to config values in clear_blind.
-                fn apply(g: &mut Game, _hand: MadeHand) {
-                    let hands_played = g.config.plays - g.plays;
-                    let discards_used = g.config.discards - g.discards_remaining;
-                    let delta = hands_played as i64 - discards_used as i64;
-                    g.set_mult_value((g.mult_value() + delta as f64).max(0.0));
-                }
-                vec![Effects::OnScore(Arc::new(Mutex::new(apply)))]
+            Self::GreenJoker(green) => {
+                let id = green.instance_id;
+                let gain = move |g: &mut Game, event: GameEvent| {
+                    if !matches!(event, GameEvent::BeforeScore(_)) {
+                        return;
+                    }
+                    let add = g
+                        .jokers
+                        .iter()
+                        .find(|j| j.instance_id() == id)
+                        .map(|j| {
+                            let aux = j.state().aux;
+                            if aux > 0.0 {
+                                aux
+                            } else {
+                                1.0
+                            }
+                        })
+                        .unwrap_or(1.0);
+                    if let Some(state) = g.joker_state_mut(id) {
+                        state.counter += add;
+                    }
+                };
+                let score = move |g: &mut Game, _hand: MadeHand| {
+                    let bonus = g
+                        .jokers
+                        .iter()
+                        .find(|j| j.instance_id() == id)
+                        .map(|j| j.state().counter.max(0.0) as f64)
+                        .unwrap_or(0.0);
+                    g.add_mult_frac(bonus);
+                };
+                let lose = move |g: &mut Game, event: GameEvent| {
+                    if matches!(event, GameEvent::Discard { .. }) {
+                        if let Some(state) = g.joker_state_mut(id) {
+                            state.counter = (state.counter - 1.0).max(0.0);
+                        }
+                    }
+                };
+                vec![
+                    Effects::OnEvent(Arc::new(Mutex::new(gain))),
+                    Effects::OnScore(Arc::new(Mutex::new(score))),
+                    Effects::OnEvent(Arc::new(Mutex::new(lose))),
+                ]
             }
             Self::HitTheRoad(_) => {
                 fn apply(g: &mut Game, _hand: MadeHand) {
@@ -4880,29 +4914,36 @@ mod tests {
             stage: Stage::Blind(Blind::Small),
             ..Default::default()
         };
-        g.money += 1000;
-        g.stage = Stage::Shop();
-        let mut j = Jokers::GreenJoker(GreenJoker::default());
-        j.set_instance_id(1);
-        g.shop.jokers.push(j.clone());
-        g.buy_joker(j).unwrap();
-        g.stage = Stage::Blind(Blind::Small);
+        let mut green = Jokers::GreenJoker(GreenJoker::default());
+        green.set_instance_id(1);
+        g.jokers.push(green);
+        g.register_jokers();
+        g.joker_state_mut(1).unwrap().aux = 1.0;
 
-        // chips = level(5) + card(11) = 16
-        // no hands played, no discards: mult = level(1) + 0 = 1; score = 16
-        assert_eq!(g.calc_score(ace_hand.clone()), 16);
-
-        g.plays -= 1; // 1 hand played
-                      // mult = 1 + (1 - 0) = 2; score = 16 * 2 = 32
+        // Fresh Green gains +1 before the hand scores: (5 + 11) * 2 = 32.
         assert_eq!(g.calc_score(ace_hand.clone()), 32);
+        assert_eq!(g.joker_state_mut(1).unwrap().counter, 1.0);
 
-        g.discards_remaining -= 1; // 1 discard used
-                                   // mult = 1 + (1 - 1) = 1; score = 16
-        assert_eq!(g.calc_score(ace_hand.clone()), 16);
+        // Next hand gains another +1: 16 * 3 = 48.
+        assert_eq!(g.calc_score(ace_hand.clone()), 48);
+        assert_eq!(g.joker_state_mut(1).unwrap().counter, 2.0);
 
-        g.discards_remaining -= 1; // 2 discards used
-                                   // mult = 1 + (1 - 2) = 0 (floored, not negative); score = 0
-        assert_eq!(g.calc_score(ace_hand), 0);
+        g.emit(GameEvent::Discard {
+            rank: HandRank::HighCard,
+            discarded: vec![Card::new(Value::Two, Suit::Spade)],
+            first: true,
+        });
+        assert_eq!(g.joker_state_mut(1).unwrap().counter, 1.0);
+        g.emit(GameEvent::Discard {
+            rank: HandRank::HighCard,
+            discarded: vec![Card::new(Value::Three, Suit::Spade)],
+            first: false,
+        });
+        assert_eq!(g.joker_state_mut(1).unwrap().counter, 0.0);
+
+        // Floored at zero; the next hand gains +1 again: 16 * 2 = 32.
+        assert_eq!(g.calc_score(ace_hand), 32);
+        assert_eq!(g.joker_state_mut(1).unwrap().counter, 1.0);
     }
 
     #[test]

@@ -2635,6 +2635,7 @@ fn initialize_new_joker(joker: &mut Jokers) {
     match joker {
         // Seltzer starts with 10 hands of retrigger.
         Jokers::Seltzer(_) if state.counter == 0.0 => state.counter = 10.0,
+        Jokers::GreenJoker(_) => state.aux = 1.0,
         Jokers::LoyaltyCard(_) => {
             state.counter = 5.0;
             state.aux = 5.0;
