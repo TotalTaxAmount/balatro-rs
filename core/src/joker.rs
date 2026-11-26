@@ -947,6 +947,44 @@ fn hand_contains_flush(rank: HandRank) -> bool {
     )
 }
 
+/// Jokers whose abilities Blueprint and Brainstorm cannot copy. Their effects
+/// are passive, trigger outside scoring, or modify rules/state globally, so a
+/// copy contributes nothing in the real game.
+fn is_copy_incompatible(joker: &Jokers) -> bool {
+    matches!(
+        joker,
+        Jokers::Astronomer(_)
+            | Jokers::ChaosTheClown(_)
+            | Jokers::Chicot(_)
+            | Jokers::Cloud9(_)
+            | Jokers::CreditCard(_)
+            | Jokers::DelayedGratification(_)
+            | Jokers::Drunkard(_)
+            | Jokers::Egg(_)
+            | Jokers::FourFingers(_)
+            | Jokers::GiftCard(_)
+            | Jokers::GoldenJoker(_)
+            | Jokers::InvisibleJoker(_)
+            | Jokers::Juggler(_)
+            | Jokers::MerryAndy(_)
+            | Jokers::MidasMask(_)
+            | Jokers::MrBones(_)
+            | Jokers::OopsAllSixes(_)
+            | Jokers::Pareidolia(_)
+            | Jokers::Rocket(_)
+            | Jokers::Satellite(_)
+            | Jokers::Shortcut(_)
+            | Jokers::Showman(_)
+            | Jokers::SixthSense(_)
+            | Jokers::SmearedJoker(_)
+            | Jokers::Splash(_)
+            | Jokers::ToTheMoon(_)
+            | Jokers::TradingCard(_)
+            | Jokers::Troubadour(_)
+            | Jokers::TurtleBean(_)
+    )
+}
+
 fn copy_effects(game: &Game, source: &Jokers, depth: usize) -> Vec<Effects> {
     if depth == 0 {
         return Vec::new();
@@ -967,7 +1005,7 @@ fn copy_effects(game: &Game, source: &Jokers, depth: usize) -> Vec<Effects> {
     let Some(target) = target else {
         return Vec::new();
     };
-    if target.instance_id() == source.instance_id() {
+    if target.instance_id() == source.instance_id() || is_copy_incompatible(target) {
         return Vec::new();
     }
 
@@ -4180,5 +4218,67 @@ mod tests {
         let hand = SelectHand::new(vec![ace]).best_hand().unwrap();
         g.calc_score(hand);
         assert_eq!(g.money, money_before);
+    }
+
+    #[test]
+    fn test_copy_incompatible_joker_list() {
+        for id in [
+            "j_astronomer",
+            "j_chaos",
+            "j_chicot",
+            "j_cloud_9",
+            "j_credit_card",
+            "j_delayed_grat",
+            "j_drunkard",
+            "j_egg",
+            "j_four_fingers",
+            "j_gift",
+            "j_golden",
+            "j_invisible",
+            "j_juggler",
+            "j_merry_andy",
+            "j_midas_mask",
+            "j_mr_bones",
+            "j_oops",
+            "j_pareidolia",
+            "j_rocket",
+            "j_satellite",
+            "j_ring_master",
+            "j_shortcut",
+            "j_sixth_sense",
+            "j_smeared",
+            "j_splash",
+            "j_to_the_moon",
+            "j_trading",
+            "j_troubadour",
+            "j_turtle_bean",
+        ] {
+            let joker = Jokers::from_id(id).unwrap_or_else(|| panic!("missing {id}"));
+            assert!(is_copy_incompatible(&joker), "{id} must be copy-incompatible");
+        }
+    }
+
+    #[test]
+    fn test_blueprint_skips_incompatible_neighbor() {
+        let mut blueprint = Jokers::Blueprint(Blueprint::default());
+        blueprint.set_instance_id(1);
+        let mut splash = Jokers::Splash(Splash::default());
+        splash.set_instance_id(2);
+        let mut g = Game::default();
+        g.jokers = vec![blueprint, splash];
+        assert!(g.jokers[0].effects(&g).is_empty());
+    }
+
+    #[test]
+    fn test_blueprint_copies_compatible_neighbor() {
+        let mut blueprint = Jokers::Blueprint(Blueprint::default());
+        blueprint.set_instance_id(1);
+        let mut joker = Jokers::TheJoker(TheJoker::default());
+        joker.set_instance_id(2);
+        let mut g = Game::default();
+        g.jokers = vec![blueprint, joker];
+        let effects = g.jokers[0].effects(&g);
+        assert_eq!(effects.len(), 1);
+        assert!(matches!(effects[0], Effects::OnScore(_)));
     }
 }
