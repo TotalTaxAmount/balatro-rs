@@ -724,7 +724,7 @@ fn sixth_sense_destroys_six_and_creates_spectral() {
     });
     assert!(g.available.cards().is_empty());
     assert_eq!(g.consumables.len(), 1);
-    assert_eq!(g.draw_adjust, 1);
+    assert_eq!(g.draw_adjust, 0);
 }
 
 #[test]
@@ -912,4 +912,24 @@ fn perkeo_copies_a_consumable_after_shop() {
     g.emit(GameEvent::ShopEnd);
     assert_eq!(g.negative_consumables.len(), 1);
     assert_eq!(g.consumables.len(), 1);
+}
+
+#[test]
+fn trading_card_destroys_without_replacement_draw() {
+    let mut g = Game::default();
+    g.deck = crate::deck::Deck::new();
+    add(&mut g, Jokers::TradingCard(TradingCard::default()));
+    register(&mut g);
+    g.stage = crate::stage::Stage::Blind(Blind::Small);
+    g.blind = Some(Blind::Small);
+    let a = card(Value::Ace, Suit::Heart);
+    let b = card(Value::King, Suit::Spade);
+    g.available = crate::available::Available::from_cards(vec![(a, true), (b, false)]);
+    g.discards_remaining = 4;
+    let money_before = g.money;
+    g.discard_selected().expect("discard");
+    // The discarded Ace is destroyed, not replaced.
+    assert_eq!(g.available.cards().len(), 1);
+    assert_eq!(g.money, money_before + 3);
+    assert_eq!(g.discards_remaining, 3);
 }

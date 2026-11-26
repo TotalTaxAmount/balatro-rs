@@ -1806,7 +1806,6 @@ impl JokerEffects for Jokers {
                         return;
                     }
                     g.destroy_card(played[0].id);
-                    g.draw_adjust += 1;
                     g.add_random_spectral();
                 }
                 vec![Effects::OnEvent(Arc::new(Mutex::new(apply)))]

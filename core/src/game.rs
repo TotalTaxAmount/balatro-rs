@@ -694,13 +694,6 @@ impl Game {
         self.discarded_this_round.extend(discarded.iter().copied());
         self.total_cards_discarded += discarded.len();
         let removed = self.available.remove_selected();
-        let n = if self.active_boss() == Some(BossBlind::Serpent) {
-            3
-        } else {
-            removed
-        };
-        self.draw(n);
-        self.check_out_of_cards();
 
         // Check for purple seals
         for card in &discarded {
@@ -728,11 +721,23 @@ impl Game {
             rank,
             all: discarded.clone(),
         };
+        // Discard effects run before the replacement draw: a destroyed
+        // discarded card (Trading Card) is not replaced in the client.
+        let destroyed_before = self.cards_destroyed;
         for e in self.effect_registry.on_discard.clone() {
             if let Effects::OnDiscard(f) = e {
                 f.lock().unwrap()(self, hand.clone())
             }
         }
+        let destroyed = self.cards_destroyed.saturating_sub(destroyed_before);
+        let mut n = if self.active_boss() == Some(BossBlind::Serpent) {
+            3
+        } else {
+            removed
+        };
+        n = n.saturating_sub(destroyed);
+        self.draw(n);
+        self.check_out_of_cards();
         self.emit(GameEvent::Discard {
             rank,
             discarded,
