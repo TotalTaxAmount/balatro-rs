@@ -39,10 +39,12 @@ fn main() {
         std::process::exit(1);
     }
 
-    let made = SelectHand::new(selected).best_hand().unwrap_or_else(|e| {
-        eprintln!("could not score selected cards: {e}");
-        std::process::exit(1);
-    });
+    let made = SelectHand::new(selected)
+        .best_hand_with_rules(game.hand_rules())
+        .unwrap_or_else(|e| {
+            eprintln!("could not score selected cards: {e}");
+            std::process::exit(1);
+        });
 
     let (score, trace) = game.calc_score_traced(made);
 

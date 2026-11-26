@@ -7,7 +7,7 @@ use crate::consumable::Consumable;
 use crate::deck::Deck;
 use crate::effect::{EffectRegistry, Effects, RuleFlag};
 use crate::error::GameError;
-use crate::hand::{MadeHand, SelectHand};
+use crate::hand::{HandRules, MadeHand, SelectHand};
 use crate::joker::{joker_display, JokerEffects, JokerState, Jokers};
 use crate::pack::{OpenPackState, Pack, PackCategory, PackContent};
 use crate::planet::Planetarium;
@@ -517,7 +517,7 @@ impl Game {
         }
         self.plays -= 1;
         let selected = SelectHand::new(self.available.selected());
-        let best = selected.best_hand()?;
+        let best = selected.best_hand_with_rules(self.hand_rules())?;
         let scored = best.clone();
         let score = self.calc_score(best);
         let clear_blind = self.handle_score(score)?;
@@ -631,12 +631,43 @@ impl Game {
     /// Whether the active boss (if any) currently debuffs card
     pub fn is_card_debuffed(&self, card: &Card) -> bool {
         match self.active_boss() {
-            Some(BossBlind::Club) => card.matches_suit(Suit::Club),
-            Some(BossBlind::Goad) => card.matches_suit(Suit::Spade),
-            Some(BossBlind::Head) => card.matches_suit(Suit::Heart),
-            Some(BossBlind::Window) => card.matches_suit(Suit::Diamond),
+            Some(BossBlind::Club) => self.matches_suit(card, Suit::Club),
+            Some(BossBlind::Goad) => self.matches_suit(card, Suit::Spade),
+            Some(BossBlind::Head) => self.matches_suit(card, Suit::Heart),
+            Some(BossBlind::Window) => self.matches_suit(card, Suit::Diamond),
             Some(BossBlind::Plant) => self.is_face_card(card),
             _ => false,
+        }
+    }
+
+    /// Active hand-classification rules from owned jokers.
+    pub fn hand_rules(&self) -> HandRules {
+        let flags = &self.effect_registry.rule_flags;
+        HandRules {
+            four_fingers: flags.contains(&RuleFlag::FourFingers),
+            shortcut: flags.contains(&RuleFlag::Shortcut),
+            smeared: flags.contains(&RuleFlag::Smeared),
+        }
+    }
+
+    pub fn has_splash(&self) -> bool {
+        self.effect_registry.rule_flags.contains(&RuleFlag::Splash)
+    }
+
+    /// Suit matching including Smeared Joker. Wild matches every suit; Stone
+    /// matches none.
+    pub fn matches_suit(&self, card: &Card, suit: Suit) -> bool {
+        if card.enhancement == Some(Enhancement::Stone) {
+            return false;
+        }
+        if card.matches_suit(suit) {
+            return true;
+        }
+        if self.hand_rules().smeared {
+            let red = |suit: Suit| matches!(suit, Suit::Heart | Suit::Diamond);
+            red(card.suit) == red(suit)
+        } else {
+            false
         }
     }
 
@@ -733,7 +764,9 @@ impl Game {
     /// Returns `None` if the selection is not a legal play (empty or more than
     /// five cards).
     pub fn calc_score_pure(&self, played: &[Card]) -> Option<ScoreEvaluation> {
-        let made = SelectHand::new(played.to_vec()).best_hand().ok()?;
+        let made = SelectHand::new(played.to_vec())
+            .best_hand_with_rules(self.hand_rules())
+            .ok()?;
 
         let hand_cards = self.available.cards();
         let selected: HashSet<usize> = played.iter().map(|card| card.id).collect();
@@ -987,16 +1020,6 @@ impl Game {
             }
         }
 
-        // first card in original play order that's actually used in scoring:
-        // either part of the made hand, or a stone kicker (which always scores).
-        // ordinary kickers that never score don't count, even if played first.
-        let hand_ids: Vec<usize> = hand.hand.cards().iter().map(|c| c.id).collect();
-        let first_played_id = hand
-            .all
-            .iter()
-            .find(|c| hand_ids.contains(&c.id) || c.enhancement == Some(Enhancement::Stone))
-            .map(|c| c.id);
-
         // Hand modifiers (e.g. Midas Mask) must run before the scored cards so
         // an overwritten enhancement (Bonus -> Gold) is reflected in this hand.
         for e in self.effect_registry.on_modify_hand.clone() {
@@ -1005,8 +1028,27 @@ impl Game {
             }
         }
 
+        // Cards that score in this pass. Splash makes every played card score;
+        // Stone cards are excluded here and handled by the Stone kicker loop
+        // below so their edition/seal is not applied twice.
+        let scoring_cards: Vec<Card> = hand.scored_cards(self.has_splash());
+
+        // first card in original play order that's actually used in scoring:
+        // either part of the made hand, or a stone kicker (which always scores).
+        // ordinary kickers that never score don't count, even if played first.
+        // Splash makes the first played card the first scoring card.
+        let hand_ids: Vec<usize> = scoring_cards.iter().map(|c| c.id).collect();
+        let first_played_id = if self.has_splash() {
+            hand.all.first().map(|c| c.id)
+        } else {
+            hand.all
+                .iter()
+                .find(|c| hand_ids.contains(&c.id) || c.enhancement == Some(Enhancement::Stone))
+                .map(|c| c.id)
+        };
+
         // per-scored-card, rank chips, enhancements, editions
-        for card in hand.hand.cards() {
+        for card in scoring_cards {
             if self.is_card_debuffed(&card) {
                 self.boss_triggered_this_hand = true;
                 continue;
@@ -1162,6 +1204,18 @@ impl Game {
                     mult_before,
                     false,
                 );
+            }
+        }
+
+        // Seltzer's counter is per-hand and must decrement exactly once even
+        // when Blueprint/Brainstorm copy its retrigger effect.
+        for joker in self.jokers.clone() {
+            if matches!(joker, Jokers::Seltzer(_)) {
+                if let Some(state) = self.joker_state_mut(joker.instance_id()) {
+                    if state.counter > 0.0 {
+                        state.counter -= 1.0;
+                    }
+                }
             }
         }
 
@@ -1375,7 +1429,7 @@ impl Game {
         Ok(())
     }
 
-    pub(crate) fn buy_joker(&mut self, joker: Jokers) -> Result<(), GameError> {
+    pub(crate) fn buy_joker(&mut self, mut joker: Jokers) -> Result<(), GameError> {
         if self.stage != Stage::Shop() {
             return Err(GameError::InvalidStage);
         }
@@ -1392,6 +1446,7 @@ impl Game {
         self.shop.buy_joker(&joker)?;
         self.money -= self.price(joker.cost());
         self.backend.on_joker_bought(&joker);
+        initialize_new_joker(&mut joker);
         self.jokers.push(joker);
         self.effect_registry
             .register_jokers(self.jokers.clone(), &self.clone());
@@ -1671,7 +1726,7 @@ impl Game {
             PackContent::Planet(p) => {
                 self.planetarium.level_up(p.hand_rank());
             }
-            PackContent::Joker(j) => {
+            PackContent::Joker(mut j) => {
                 if j.edition() == Edition::Negative {
                     self.config.joker_slots =
                         (self.config.joker_slots + 1).min(self.config.joker_slots_max);
@@ -1679,6 +1734,7 @@ impl Game {
                 if self.jokers.len() >= self.joker_slots() {
                     return Err(GameError::NoAvailableSlot);
                 }
+                initialize_new_joker(&mut j);
                 self.jokers.push(j);
                 self.effect_registry
                     .register_jokers(self.jokers.clone(), &self.clone());
@@ -2043,6 +2099,15 @@ impl fmt::Display for Game {
         } else {
             writeln!(f, "score: {}", self.score)
         }
+    }
+}
+
+fn initialize_new_joker(joker: &mut Jokers) {
+    // Seltzer starts with 10 hands of retrigger.
+    if matches!(joker, Jokers::Seltzer(_)) && joker.state().counter == 0.0 {
+        let mut state = joker.state();
+        state.counter = 10.0;
+        joker.set_state(state);
     }
 }
 
@@ -3440,14 +3505,390 @@ mod tests {
     }
 
     #[test]
+    fn test_splash_scores_all_played_kickers() {
+        use crate::joker::*;
+        let mut g = Game::default();
+        let mut splash = Jokers::Splash(Splash::default());
+        splash.set_instance_id(1);
+        g.jokers.push(splash);
+        g.effect_registry
+            .register_jokers(g.jokers.clone(), &g.clone());
+
+        let cards = vec![
+            Card::new(Value::King, Suit::Heart),
+            Card::new(Value::King, Suit::Spade),
+            Card::new(Value::Two, Suit::Club),
+            Card::new(Value::Three, Suit::Diamond),
+            Card::new(Value::Four, Suit::Heart),
+        ];
+        let hand = SelectHand::new(cards).best_hand().unwrap();
+
+        // Pair base 10 chips / 2 mult. Kings 10 each, kickers 2+3+4.
+        // (10 + 10 + 10 + 2 + 3 + 4) * 2 = 78.
+        assert_eq!(g.calc_score(hand), 78);
+    }
+
+    #[test]
+    fn test_blueprint_copies_joker_to_the_right() {
+        use crate::joker::*;
+        let mut g = Game::default();
+        let mut blueprint = Jokers::Blueprint(Blueprint::default());
+        blueprint.set_instance_id(1);
+        let mut joker = Jokers::TheJoker(TheJoker::default());
+        joker.set_instance_id(2);
+        g.jokers.push(blueprint);
+        g.jokers.push(joker);
+        g.effect_registry
+            .register_jokers(g.jokers.clone(), &g.clone());
+
+        let hand = SelectHand::new(vec![Card::new(Value::Ace, Suit::Heart)])
+            .best_hand()
+            .unwrap();
+        // High Card: (5 + 11) * (1 + 4 + 4) = 144.
+        assert_eq!(g.calc_score(hand), 144);
+    }
+
+    #[test]
+    fn test_blueprint_with_nothing_to_the_right_copies_nothing() {
+        use crate::joker::*;
+        let mut g = Game::default();
+        let mut blueprint = Jokers::Blueprint(Blueprint::default());
+        blueprint.set_instance_id(1);
+        g.jokers.push(blueprint);
+        g.effect_registry
+            .register_jokers(g.jokers.clone(), &g.clone());
+
+        let hand = SelectHand::new(vec![Card::new(Value::Ace, Suit::Heart)])
+            .best_hand()
+            .unwrap();
+        // High Card: (5 + 11) * 1 = 16.
+        assert_eq!(g.calc_score(hand), 16);
+    }
+
+    #[test]
+    fn test_brainstorm_copies_leftmost_joker() {
+        use crate::joker::*;
+        let mut g = Game::default();
+        let mut joker = Jokers::TheJoker(TheJoker::default());
+        joker.set_instance_id(1);
+        let mut brainstorm = Jokers::Brainstorm(Brainstorm::default());
+        brainstorm.set_instance_id(2);
+        g.jokers.push(joker);
+        g.jokers.push(brainstorm);
+        g.effect_registry
+            .register_jokers(g.jokers.clone(), &g.clone());
+
+        let hand = SelectHand::new(vec![Card::new(Value::Ace, Suit::Heart)])
+            .best_hand()
+            .unwrap();
+        // High Card: (5 + 11) * (1 + 4 + 4) = 144.
+        assert_eq!(g.calc_score(hand), 144);
+    }
+
+    #[test]
+    fn test_seltzer_retriggers_and_decrements_to_zero() {
+        use crate::joker::*;
+        let mut g = Game::default();
+        let mut seltzer = Jokers::Seltzer(Seltzer::default());
+        seltzer.set_instance_id(1);
+        let mut state = seltzer.state();
+        state.counter = 2.0;
+        seltzer.set_state(state);
+        g.jokers.push(seltzer);
+        g.effect_registry
+            .register_jokers(g.jokers.clone(), &g.clone());
+
+        let hand = SelectHand::new(vec![Card::new(Value::Ace, Suit::Heart)])
+            .best_hand()
+            .unwrap();
+        // Retrigger while counters remain: (5 + 11 + 11) * 1 = 27.
+        assert_eq!(g.calc_score(hand.clone()), 27);
+        assert_eq!(g.jokers[0].state().counter, 1.0);
+        assert_eq!(g.calc_score(hand.clone()), 27);
+        assert_eq!(g.jokers[0].state().counter, 0.0);
+        // Exhausted: (5 + 11) * 1 = 16.
+        assert_eq!(g.calc_score(hand), 16);
+    }
+
+    #[test]
+    fn test_smeared_joker_makes_suit_jokers_count_both_colors() {
+        use crate::joker::*;
+        // Greedy Joker normally only counts Diamonds. With Smeared Joker a
+        // Heart also counts as a Diamond.
+        let mut g = Game::default();
+        let mut greedy = Jokers::GreedyJoker(GreedyJoker::default());
+        greedy.set_instance_id(1);
+        let mut smeared = Jokers::SmearedJoker(SmearedJoker::default());
+        smeared.set_instance_id(2);
+        g.jokers.push(greedy);
+        g.jokers.push(smeared);
+        g.effect_registry
+            .register_jokers(g.jokers.clone(), &g.clone());
+
+        let heart = Card::new(Value::Ace, Suit::Heart);
+        assert!(g.matches_suit(&heart, Suit::Diamond));
+        let hand = SelectHand::new(vec![heart]).best_hand().unwrap();
+        // High Card: (5 + 11) * (1 + 3) = 64.
+        assert_eq!(g.calc_score(hand), 64);
+    }
+
+    #[test]
+    fn test_four_fingers_and_shortcut_rule_flags_and_classification() {
+        use crate::joker::*;
+        let mut g = Game::default();
+        let mut four = Jokers::FourFingers(FourFingers::default());
+        four.set_instance_id(1);
+        let mut shortcut = Jokers::Shortcut(Shortcut::default());
+        shortcut.set_instance_id(2);
+        g.jokers.push(four);
+        g.jokers.push(shortcut);
+        g.effect_registry
+            .register_jokers(g.jokers.clone(), &g.clone());
+
+        let rules = g.hand_rules();
+        assert!(rules.four_fingers);
+        assert!(rules.shortcut);
+        assert!(!rules.smeared);
+
+        // Four-card flush: 35 base + A+K+Q+9 = 40 chips, 4 mult -> 300.
+        let flush = vec![
+            Card::new(Value::Ace, Suit::Heart),
+            Card::new(Value::King, Suit::Heart),
+            Card::new(Value::Queen, Suit::Heart),
+            Card::new(Value::Nine, Suit::Heart),
+        ];
+        let hand = SelectHand::new(flush).best_hand_with_rules(rules).unwrap();
+        assert_eq!(hand.rank, HandRank::Flush);
+        assert_eq!(g.calc_score(hand), 300);
+
+        // Gapped straight: 30 base + 2+3+5+6+7 = 23 chips, 4 mult -> 212.
+        let straight = vec![
+            Card::new(Value::Two, Suit::Heart),
+            Card::new(Value::Three, Suit::Diamond),
+            Card::new(Value::Five, Suit::Club),
+            Card::new(Value::Six, Suit::Spade),
+            Card::new(Value::Seven, Suit::Heart),
+        ];
+        let hand = SelectHand::new(straight)
+            .best_hand_with_rules(rules)
+            .unwrap();
+        assert_eq!(hand.rank, HandRank::Straight);
+        assert_eq!(g.calc_score(hand), 212);
+    }
+
+    #[test]
+    fn test_splash_lets_suit_jokers_count_kickers() {
+        use crate::joker::*;
+        let mut g = Game::default();
+        let mut splash = Jokers::Splash(Splash::default());
+        splash.set_instance_id(1);
+        let mut greedy = Jokers::GreedyJoker(GreedyJoker::default());
+        greedy.set_instance_id(2);
+        g.jokers.push(splash);
+        g.jokers.push(greedy);
+        g.effect_registry
+            .register_jokers(g.jokers.clone(), &g.clone());
+
+        let cards = vec![
+            Card::new(Value::King, Suit::Heart),
+            Card::new(Value::King, Suit::Diamond),
+            Card::new(Value::Two, Suit::Diamond),
+            Card::new(Value::Three, Suit::Diamond),
+        ];
+        let hand = SelectHand::new(cards).best_hand().unwrap();
+        // Pair base 10 + K10+K10+2+3 = 35 chips. Greedy counts all three
+        // scored Diamonds: 2 + 9 = 11 mult. 35 * 11 = 385.
+        assert_eq!(g.calc_score(hand), 385);
+    }
+
+    #[test]
+    fn test_splash_lets_value_jokers_count_kickers() {
+        use crate::joker::*;
+        let mut g = Game::default();
+        let mut splash = Jokers::Splash(Splash::default());
+        splash.set_instance_id(1);
+        let mut fibonacci = Jokers::Fibonacci(Fibonacci::default());
+        fibonacci.set_instance_id(2);
+        g.jokers.push(splash);
+        g.jokers.push(fibonacci);
+        g.effect_registry
+            .register_jokers(g.jokers.clone(), &g.clone());
+
+        let cards = vec![
+            Card::new(Value::King, Suit::Heart),
+            Card::new(Value::King, Suit::Diamond),
+            Card::new(Value::Two, Suit::Club),
+        ];
+        let hand = SelectHand::new(cards).best_hand().unwrap();
+        // Pair base 10 + K10+K10+2 = 32 chips. Fibonacci sees the kicker 2:
+        // 2 + 8 = 10 mult. 32 * 10 = 320.
+        assert_eq!(g.calc_score(hand), 320);
+    }
+
+    #[test]
+    fn test_half_joker_counts_all_played_cards() {
+        use crate::joker::*;
+        let mut g = Game::default();
+        let mut half = Jokers::HalfJoker(HalfJoker::default());
+        half.set_instance_id(1);
+        g.jokers.push(half);
+        g.effect_registry
+            .register_jokers(g.jokers.clone(), &g.clone());
+
+        // Pair plus three kickers: five cards played, so Half Joker must not
+        // fire even though only two cards make the pair.
+        let cards = vec![
+            Card::new(Value::King, Suit::Heart),
+            Card::new(Value::King, Suit::Diamond),
+            Card::new(Value::Nine, Suit::Club),
+            Card::new(Value::Seven, Suit::Spade),
+            Card::new(Value::Four, Suit::Heart),
+        ];
+        let hand = SelectHand::new(cards).best_hand().unwrap();
+        // Only the pair scores: (10 + 10 + 10) * 2 = 60. Half Joker must
+        // not add its +20 because five cards were played.
+        assert_eq!(g.calc_score(hand), 60);
+    }
+
+    #[test]
+    fn test_ride_the_bus_resets_on_face_kicker() {
+        use crate::joker::*;
+        let mut g = Game::default();
+        let mut bus = Jokers::RideTheBus(RideTheBus::default());
+        bus.set_instance_id(1);
+        g.jokers.push(bus);
+        g.effect_registry
+            .register_jokers(g.jokers.clone(), &g.clone());
+
+        let with_kicker = vec![
+            Card::new(Value::Two, Suit::Heart),
+            Card::new(Value::Two, Suit::Diamond),
+            Card::new(Value::King, Suit::Club),
+        ];
+        let hand = SelectHand::new(with_kicker).best_hand().unwrap();
+        // Pair of Twos: (10 + 2 + 2) * 2 = 28. The face kicker resets the
+        // streak, so no Mult is gained.
+        assert_eq!(g.calc_score(hand), 28);
+        assert_eq!(g.consecutive_hands_without_face_card, 0);
+
+        let pair = vec![
+            Card::new(Value::Two, Suit::Heart),
+            Card::new(Value::Two, Suit::Diamond),
+        ];
+        let hand = SelectHand::new(pair).best_hand().unwrap();
+        // Pair: (10 + 4) * (2 + 1) = 42.
+        assert_eq!(g.calc_score(hand), 42);
+        assert_eq!(g.consecutive_hands_without_face_card, 1);
+    }
+
+    #[test]
+    fn test_rule_aware_contains_jokers() {
+        use crate::joker::*;
+        let mut g = Game::default();
+        let mut order = Jokers::TheOrder(TheOrder::default());
+        order.set_instance_id(1);
+        let mut tribe = Jokers::TheTribe(TheTribe::default());
+        tribe.set_instance_id(2);
+        let mut shortcut = Jokers::Shortcut(Shortcut::default());
+        shortcut.set_instance_id(3);
+        let mut four = Jokers::FourFingers(FourFingers::default());
+        four.set_instance_id(4);
+        g.jokers.push(order);
+        g.jokers.push(tribe);
+        g.jokers.push(shortcut);
+        g.jokers.push(four);
+        g.effect_registry
+            .register_jokers(g.jokers.clone(), &g.clone());
+
+        let rules = g.hand_rules();
+        // Shortcut straight: (30 + 2+3+5+6+7) * (4 * 3) = 53 * 12 = 636.
+        let straight = vec![
+            Card::new(Value::Two, Suit::Heart),
+            Card::new(Value::Three, Suit::Diamond),
+            Card::new(Value::Five, Suit::Club),
+            Card::new(Value::Six, Suit::Spade),
+            Card::new(Value::Seven, Suit::Heart),
+        ];
+        let hand = SelectHand::new(straight)
+            .best_hand_with_rules(rules)
+            .unwrap();
+        assert_eq!(hand.rank, HandRank::Straight);
+        assert_eq!(g.calc_score(hand), 636);
+
+        // Four Fingers flush: (35 + 11+10+10+9) * (4 * 2) = 75 * 8 = 600.
+        let flush = vec![
+            Card::new(Value::Ace, Suit::Heart),
+            Card::new(Value::King, Suit::Heart),
+            Card::new(Value::Queen, Suit::Heart),
+            Card::new(Value::Nine, Suit::Heart),
+        ];
+        let hand = SelectHand::new(flush).best_hand_with_rules(rules).unwrap();
+        assert_eq!(hand.rank, HandRank::Flush);
+        assert_eq!(g.calc_score(hand), 600);
+    }
+
+    #[test]
+    fn test_midas_mask_with_splash_gilds_kicker_faces() {
+        use crate::joker::*;
+        let mut g = Game::default();
+        let mut midas = Jokers::MidasMask(MidasMask::default());
+        midas.set_instance_id(1);
+        let mut splash = Jokers::Splash(Splash::default());
+        splash.set_instance_id(2);
+        g.jokers.push(midas);
+        g.jokers.push(splash);
+        g.effect_registry
+            .register_jokers(g.jokers.clone(), &g.clone());
+
+        let cards = vec![
+            Card::new(Value::King, Suit::Heart),
+            Card::new(Value::King, Suit::Diamond),
+            Card::new(Value::Queen, Suit::Club),
+        ];
+        g.available = Available::from_cards(cards.iter().map(|card| (*card, false)).collect());
+        let hand = SelectHand::new(cards).best_hand().unwrap();
+        // All three cards score under Splash, so the Queen kicker becomes
+        // Gold before scoring. Pair: 10 + 10+10+10 = 40 chips, 2 mult = 80.
+        // Gold cards pay $3 at end of round, not per hand, so money is 0.
+        assert_eq!(g.calc_score(hand), 80);
+        // The Queen kicker was not part of the made hand, but it did score.
+        assert_eq!(g.available.cards()[2].enhancement, Some(Enhancement::Gold));
+    }
+
+    #[test]
+    fn test_blueprint_copies_seltzer_without_double_decrementing() {
+        use crate::joker::*;
+        let mut g = Game::default();
+        let mut blueprint = Jokers::Blueprint(Blueprint::default());
+        blueprint.set_instance_id(1);
+        let mut seltzer = Jokers::Seltzer(Seltzer::default());
+        seltzer.set_instance_id(2);
+        let mut state = seltzer.state();
+        state.counter = 10.0;
+        seltzer.set_state(state);
+        g.jokers.push(blueprint);
+        g.jokers.push(seltzer);
+        g.effect_registry
+            .register_jokers(g.jokers.clone(), &g.clone());
+
+        let hand = SelectHand::new(vec![Card::new(Value::Ace, Suit::Heart)])
+            .best_hand()
+            .unwrap();
+        // Three triggers (Seltzer + copied Seltzer): (5 + 11*3) * 1 = 38.
+        assert_eq!(g.calc_score(hand.clone()), 38);
+        // The copied retrigger must not decrement the counter twice.
+        assert_eq!(g.jokers[1].state().counter, 9.0);
+        assert_eq!(g.calc_score(hand), 38);
+        assert_eq!(g.jokers[1].state().counter, 8.0);
+    }
+
+    #[test]
     fn test_joker_stencil_counts_its_own_slot() {
         let card = Card::new(Value::Ace, Suit::Heart);
         let hand = SelectHand::new(vec![card]).best_hand().unwrap();
 
         let mut g = Game::default();
-        g.jokers = vec![Jokers::JokerStencil(
-            crate::joker::JokerStencil::default(),
-        )];
+        g.jokers = vec![Jokers::JokerStencil(crate::joker::JokerStencil::default())];
         g.effect_registry
             .register_jokers(g.jokers.clone(), &g.clone());
 

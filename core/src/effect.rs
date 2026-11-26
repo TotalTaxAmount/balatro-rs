@@ -15,6 +15,10 @@ type CardTriggerFn = Arc<Mutex<dyn Fn(&mut Game, Card, bool) -> usize + Send + '
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RuleFlag {
     AllCardsAreFace,
+    FourFingers,
+    Shortcut,
+    Smeared,
+    Splash,
 }
 
 #[derive(Debug, Clone)]

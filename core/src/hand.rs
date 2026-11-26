@@ -2,6 +2,7 @@ use indexmap::IndexMap;
 use itertools::Itertools;
 #[cfg(feature = "python")]
 use pyo3::pyclass;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 
 use crate::card::Card;
@@ -22,6 +23,14 @@ use crate::rank::HandRank;
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct Hand(Vec<Card>);
 
+/// Rule flags that change how a selected hand is classified.
+#[derive(Debug, Clone, Copy, Default, Hash, PartialEq, Eq)]
+pub struct HandRules {
+    pub four_fingers: bool,
+    pub shortcut: bool,
+    pub smeared: bool,
+}
+
 // MadeHand represents actual poker hand level and associated cards from a selected hand.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -29,6 +38,24 @@ pub struct MadeHand {
     pub hand: SelectHand,
     pub rank: HandRank,
     pub all: Vec<Card>,
+}
+
+impl MadeHand {
+    /// Cards that score this hand. Normally only the made-hand subset scores,
+    /// but Splash makes every played card score. Stone cards are excluded here
+    /// because they are handled by the dedicated Stone scoring pass; keeping
+    /// them out prevents their edition/seal from being applied twice.
+    pub fn scored_cards(&self, splash: bool) -> Vec<Card> {
+        if splash {
+            self.all
+                .iter()
+                .filter(|card| card.enhancement != Some(Enhancement::Stone))
+                .copied()
+                .collect()
+        } else {
+            self.hand.cards()
+        }
+    }
 }
 
 // SelectHand represents (up to 5) cards user selects from hand for action
@@ -53,6 +80,47 @@ impl SelectHand {
             .map(|x| x.value)
             .sorted()
             .collect()
+    }
+
+    fn rank_value(value: Value) -> u8 {
+        match value {
+            Value::Two => 2,
+            Value::Three => 3,
+            Value::Four => 4,
+            Value::Five => 5,
+            Value::Six => 6,
+            Value::Seven => 7,
+            Value::Eight => 8,
+            Value::Nine => 9,
+            Value::Ten => 10,
+            Value::Jack => 11,
+            Value::Queen => 12,
+            Value::King => 13,
+            Value::Ace => 14,
+        }
+    }
+
+    /// Red suits share a group under Smeared Joker; black suits share the other.
+    fn suit_group(suit: Suit, smeared: bool) -> u8 {
+        if smeared {
+            match suit {
+                Suit::Heart | Suit::Diamond => 0,
+                Suit::Club | Suit::Spade => 1,
+            }
+        } else {
+            suit as u8
+        }
+    }
+
+    fn order_by_hand(&self, cards: &[Card]) -> SelectHand {
+        let ids: HashSet<usize> = cards.iter().map(|card| card.id).collect();
+        SelectHand::new(
+            self.0
+                .iter()
+                .filter(|card| ids.contains(&card.id))
+                .cloned()
+                .collect(),
+        )
     }
     pub(crate) fn cards(&self) -> Vec<Card> {
         self.0.clone()
@@ -116,27 +184,13 @@ impl SelectHand {
             .collect()
     }
 
-    /// Can play any number of cards, it is our responsibility
-    /// to determine the best hand. Higher tier hands take precedence
-    /// over lower tier hands regardless of their level or scoring.
-    /// For example, if hand is Kd Kd Kd Kd 2d, best hand will be a
-    // Four of a Kind and never a Flush.
-    //
-    // Hand ranking:
-    // FlushFive
-    // FlushHouse
-    // FiveOfAKind
-    // RoyalFlush
-    // StraightFlush
-    // FourOfAKind
-    // FullHouse
-    // Flush
-    // Straight
-    // ThreeOfAKind
-    // TwoPair
-    // OnePair
-    // HighCard
+    /// Can play any number of cards; the caller provides the active rule
+    /// flags (Four Fingers / Shortcut / Smeared Joker).
     pub fn best_hand(&self) -> Result<MadeHand, PlayHandError> {
+        self.best_hand_with_rules(HandRules::default())
+    }
+
+    pub fn best_hand_with_rules(&self, rules: HandRules) -> Result<MadeHand, PlayHandError> {
         if self.0.is_empty() {
             return Err(PlayHandError::NoCards);
         }
@@ -144,25 +198,25 @@ impl SelectHand {
             return Err(PlayHandError::TooManyCards);
         }
 
-        // We start trying to evaluate best hands first, so we
-        // can return best hand right when we find it.
-        let (hand, rank) = if let Some(hand) = self.is_flush_five() {
+        // Higher-tier hands take precedence over lower-tier hands regardless
+        // of their level or scoring.
+        let (hand, rank) = if let Some(hand) = self.is_flush_five_with_rules(rules) {
             (hand, HandRank::FlushFive)
-        } else if let Some(hand) = self.is_flush_house() {
+        } else if let Some(hand) = self.is_flush_house_with_rules(rules) {
             (hand, HandRank::FlushHouse)
         } else if let Some(hand) = self.is_five_of_kind() {
             (hand, HandRank::FiveOfAKind)
-        } else if let Some(hand) = self.is_royal_flush() {
+        } else if let Some(hand) = self.is_royal_flush_with_rules(rules) {
             (hand, HandRank::RoyalFlush)
-        } else if let Some(hand) = self.is_straight_flush() {
+        } else if let Some(hand) = self.is_straight_flush_with_rules(rules) {
             (hand, HandRank::StraightFlush)
         } else if let Some(hand) = self.is_four_of_kind() {
             (hand, HandRank::FourOfAKind)
         } else if let Some(hand) = self.is_fullhouse() {
             (hand, HandRank::FullHouse)
-        } else if let Some(hand) = self.is_flush() {
+        } else if let Some(hand) = self.is_flush_with_rules(rules) {
             (hand, HandRank::Flush)
-        } else if let Some(hand) = self.is_straight() {
+        } else if let Some(hand) = self.is_straight_with_rules(rules) {
             (hand, HandRank::Straight)
         } else if let Some(hand) = self.is_three_of_kind() {
             (hand, HandRank::ThreeOfAKind)
@@ -175,6 +229,7 @@ impl SelectHand {
         } else {
             return Err(PlayHandError::UnknownHand);
         };
+
         Ok(MadeHand {
             hand,
             rank,
@@ -240,65 +295,129 @@ impl SelectHand {
         Some(SelectHand::new(self.cards_of_values(&[value])))
     }
 
+    #[cfg(test)]
     pub(crate) fn is_straight(&self) -> Option<SelectHand> {
-        // Stone cards have no rank and cannot fill a straight.
-        let values = self.values();
-        if values.len() != 5 {
-            return None;
-        }
-        // Iterate our sorted values. Each value must be one more than the previous.
-        if values.windows(2).all(|v| (v[1] as u16 - v[0] as u16) == 1) {
-            return Some(self.clone());
-        }
+        self.is_straight_with_rules(HandRules::default())
+    }
 
-        // Special case for low ace.
-        // Values are sorted with Ace as high (2, 3, 4, 5, A)
-        // Therefore, we can check that last value is ace, first value is two.
-        // Then remove the last value (ace) from vec and check for incremental values
-        // for everything else (2, 3, 4, 5).
-        if values[4] == Value::Ace && values[0] == Value::Two {
-            let skip_last: Vec<Value> = values.into_iter().rev().skip(1).rev().collect();
-            if skip_last
-                .windows(2)
-                .all(|v| (v[1] as u16 - v[0] as u16) == 1)
-            {
-                return Some(self.clone());
+    pub(crate) fn is_straight_with_rules(&self, rules: HandRules) -> Option<SelectHand> {
+        let lengths: &[usize] = if rules.four_fingers { &[5, 4] } else { &[5] };
+        for &length in lengths {
+            if let Some(hand) = self.straight_of_length(length, rules.shortcut) {
+                return Some(hand);
             }
         }
         None
     }
 
-    pub(crate) fn is_flush(&self) -> Option<SelectHand> {
-        if self.len() < 5 {
+    /// Find a straight of `length` distinct ranks. `shortcut` allows a one-rank
+    /// gap between consecutive cards. Ace can be high (14) or low (1).
+    fn straight_of_length(&self, length: usize, shortcut: bool) -> Option<SelectHand> {
+        let mut by_rank: BTreeMap<u8, Card> = BTreeMap::new();
+        let mut ace: Option<Card> = None;
+        for card in &self.0 {
+            if card.enhancement == Some(Enhancement::Stone) {
+                continue;
+            }
+            let rank = Self::rank_value(card.value);
+            by_rank.entry(rank).or_insert(*card);
+            if card.value == Value::Ace {
+                ace = Some(*card);
+            }
+        }
+        if let Some(ace) = ace {
+            by_rank.insert(1, ace);
+        }
+        if by_rank.len() < length {
             return None;
         }
-        // Each wild card in hand reduces the number of a suit needed to make a flush
-        // since a wild can be any suit.
+
+        let ranks: Vec<u8> = by_rank.keys().copied().collect();
+        let mut best: Option<Vec<Card>> = None;
+        let mut best_chips = 0;
+
+        for values in ranks.iter().copied().combinations(length) {
+            if values.contains(&1) && values.contains(&14) {
+                continue;
+            }
+            let gaps_ok = values.windows(2).all(|window| {
+                let gap = window[1] - window[0];
+                if shortcut {
+                    gap == 1 || gap == 2
+                } else {
+                    gap == 1
+                }
+            });
+            if !gaps_ok {
+                continue;
+            }
+            let cards: Vec<Card> = values
+                .iter()
+                .filter_map(|rank| by_rank.get(rank).copied())
+                .collect();
+            if cards.len() != length {
+                continue;
+            }
+            let chips: usize = cards.iter().map(Card::chips).sum();
+            if chips > best_chips {
+                best_chips = chips;
+                best = Some(cards);
+            }
+        }
+
+        best.map(|cards| self.order_by_hand(&cards))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_flush(&self) -> Option<SelectHand> {
+        self.is_flush_with_rules(HandRules::default())
+    }
+
+    pub(crate) fn is_flush_with_rules(&self, rules: HandRules) -> Option<SelectHand> {
+        let base_needed = if rules.four_fingers { 4 } else { 5 };
         let wilds: Vec<Card> = self
             .0
             .iter()
-            .filter(|c| c.enhancement == Some(Enhancement::Wild))
+            .filter(|card| card.enhancement == Some(Enhancement::Wild))
             .cloned()
             .collect();
-        let wild_count = wilds.len();
-        let needed = 5usize.saturating_sub(wild_count);
 
-        if needed == 0 {
-            return Some(self.clone());
+        if wilds.len() >= base_needed {
+            let non_stone: Vec<Card> = self
+                .0
+                .iter()
+                .filter(|card| card.enhancement != Some(Enhancement::Stone))
+                .cloned()
+                .collect();
+            return Some(SelectHand::new(non_stone));
         }
 
-        let mut suit_groups: IndexMap<Suit, Vec<Card>> = IndexMap::new();
-        for card in self.0.iter().filter(|c| {
-            c.enhancement != Some(Enhancement::Wild) && c.enhancement != Some(Enhancement::Stone)
+        let needed = base_needed - wilds.len();
+        let mut groups: IndexMap<u8, Vec<Card>> = IndexMap::new();
+        for card in self.0.iter().filter(|card| {
+            card.enhancement != Some(Enhancement::Wild)
+                && card.enhancement != Some(Enhancement::Stone)
         }) {
-            suit_groups.entry(card.suit).or_default().push(*card);
+            let group = Self::suit_group(card.suit, rules.smeared);
+            groups.entry(group).or_default().push(*card);
         }
 
-        if let Some((_, mut cards)) = suit_groups.into_iter().find(|(_, v)| v.len() >= needed) {
-            cards.extend(wilds);
-            return Some(SelectHand::new(cards));
+        let mut best: Option<SelectHand> = None;
+        let mut best_chips = 0;
+        for group in groups.values() {
+            if group.len() < needed {
+                continue;
+            }
+            let mut cards = group.clone();
+            cards.extend(wilds.iter().copied());
+            let ordered = self.order_by_hand(&cards);
+            let chips: usize = ordered.cards().iter().map(Card::chips).sum();
+            if chips > best_chips {
+                best_chips = chips;
+                best = Some(ordered);
+            }
         }
-        None
+        best
     }
 
     pub(crate) fn is_fullhouse(&self) -> Option<SelectHand> {
@@ -330,26 +449,37 @@ impl SelectHand {
         Some(SelectHand::new(self.cards_of_values(&[value])))
     }
 
+    #[cfg(test)]
     pub(crate) fn is_straight_flush(&self) -> Option<SelectHand> {
-        if self.is_flush().is_some() && self.is_straight().is_some() {
-            return Some(self.clone());
-        }
-        None
+        self.is_straight_flush_with_rules(HandRules::default())
     }
 
+    pub(crate) fn is_straight_flush_with_rules(&self, rules: HandRules) -> Option<SelectHand> {
+        let flush = self.is_flush_with_rules(rules)?;
+        flush.is_straight_with_rules(rules)
+    }
+
+    #[cfg(test)]
     pub(crate) fn is_royal_flush(&self) -> Option<SelectHand> {
-        if self.is_straight_flush().is_some()
-            && self.values().into_iter().eq(vec![
+        self.is_royal_flush_with_rules(HandRules::default())
+    }
+
+    pub(crate) fn is_royal_flush_with_rules(&self, rules: HandRules) -> Option<SelectHand> {
+        let hand = self.is_straight_flush_with_rules(rules)?;
+        let values = hand.values();
+        if values
+            == vec![
                 Value::Ten,
                 Value::Jack,
                 Value::Queen,
                 Value::King,
                 Value::Ace,
-            ])
+            ]
         {
-            return Some(self.clone());
+            Some(hand)
+        } else {
+            None
         }
-        None
     }
 
     pub(crate) fn is_five_of_kind(&self) -> Option<SelectHand> {
@@ -363,18 +493,30 @@ impl SelectHand {
         Some(SelectHand::new(self.cards_of_values(&[value])))
     }
 
+    #[cfg(test)]
     pub(crate) fn is_flush_house(&self) -> Option<SelectHand> {
-        if self.is_flush().is_some() && self.is_fullhouse().is_some() {
-            return Some(self.clone());
-        }
-        None
+        self.is_flush_house_with_rules(HandRules::default())
     }
 
-    pub(crate) fn is_flush_five(&self) -> Option<SelectHand> {
-        if self.is_flush().is_some() && self.is_five_of_kind().is_some() {
-            return Some(self.clone());
+    pub(crate) fn is_flush_house_with_rules(&self, rules: HandRules) -> Option<SelectHand> {
+        let flush = self.is_flush_with_rules(rules)?;
+        if flush.len() != 5 {
+            return None;
         }
-        None
+        flush.is_fullhouse()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_flush_five(&self) -> Option<SelectHand> {
+        self.is_flush_five_with_rules(HandRules::default())
+    }
+
+    pub(crate) fn is_flush_five_with_rules(&self, rules: HandRules) -> Option<SelectHand> {
+        let flush = self.is_flush_with_rules(rules)?;
+        if flush.len() != 5 {
+            return None;
+        }
+        flush.is_five_of_kind()
     }
 }
 
@@ -1181,5 +1323,80 @@ mod tests {
         let best = SelectHand::new(vec![stone]).best_hand().unwrap();
         assert_eq!(best.rank, HandRank::HighCard);
         assert!(best.hand.cards().is_empty());
+    }
+
+    #[test]
+    fn test_four_fingers_four_card_flush_and_straight() {
+        let flush = vec![
+            Card::new(Value::Ace, Suit::Heart),
+            Card::new(Value::King, Suit::Heart),
+            Card::new(Value::Queen, Suit::Heart),
+            Card::new(Value::Nine, Suit::Heart),
+        ];
+        let rules = HandRules {
+            four_fingers: true,
+            ..Default::default()
+        };
+        let best = SelectHand::new(flush).best_hand_with_rules(rules).unwrap();
+        assert_eq!(best.rank, HandRank::Flush);
+        assert_eq!(best.hand.len(), 4);
+
+        let straight = vec![
+            Card::new(Value::Two, Suit::Heart),
+            Card::new(Value::Three, Suit::Diamond),
+            Card::new(Value::Four, Suit::Club),
+            Card::new(Value::Five, Suit::Spade),
+        ];
+        let best = SelectHand::new(straight)
+            .best_hand_with_rules(rules)
+            .unwrap();
+        assert_eq!(best.rank, HandRank::Straight);
+        assert_eq!(best.hand.len(), 4);
+    }
+
+    #[test]
+    fn test_shortcut_allows_one_rank_gap() {
+        let cards = vec![
+            Card::new(Value::Two, Suit::Heart),
+            Card::new(Value::Three, Suit::Diamond),
+            Card::new(Value::Five, Suit::Club),
+            Card::new(Value::Six, Suit::Spade),
+            Card::new(Value::Seven, Suit::Heart),
+        ];
+        let rules = HandRules {
+            shortcut: true,
+            ..Default::default()
+        };
+        let best = SelectHand::new(cards.clone())
+            .best_hand_with_rules(rules)
+            .unwrap();
+        assert_eq!(best.rank, HandRank::Straight);
+        assert_eq!(best.hand.len(), 5);
+
+        let normal = SelectHand::new(cards).best_hand().unwrap();
+        assert_ne!(normal.rank, HandRank::Straight);
+    }
+
+    #[test]
+    fn test_smeared_joker_makes_red_flush() {
+        let cards = vec![
+            Card::new(Value::Ace, Suit::Heart),
+            Card::new(Value::King, Suit::Diamond),
+            Card::new(Value::Queen, Suit::Heart),
+            Card::new(Value::Jack, Suit::Diamond),
+            Card::new(Value::Nine, Suit::Heart),
+        ];
+        let rules = HandRules {
+            smeared: true,
+            ..Default::default()
+        };
+        let best = SelectHand::new(cards.clone())
+            .best_hand_with_rules(rules)
+            .unwrap();
+        assert_eq!(best.rank, HandRank::Flush);
+        assert_eq!(best.hand.len(), 5);
+
+        let normal = SelectHand::new(cards).best_hand().unwrap();
+        assert_ne!(normal.rank, HandRank::Flush);
     }
 }

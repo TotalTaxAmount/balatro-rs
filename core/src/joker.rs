@@ -4,6 +4,7 @@ use crate::game::Game;
 use crate::hand::{MadeHand, SelectHand};
 use crate::rank::HandRank;
 use rand::Rng;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use strum::IntoEnumIterator;
@@ -75,9 +76,9 @@ impl JokerEffects for Jokers {
             Self::GreedyJoker(_) => {
                 fn apply(g: &mut Game, hand: MadeHand) {
                     let diamonds = g
-                        .non_debuffed(hand.hand.cards().iter())
+                        .non_debuffed(hand.scored_cards(g.has_splash()).iter())
                         .iter()
-                        .filter(|c| c.matches_suit(Suit::Diamond))
+                        .filter(|c| g.matches_suit(*c, Suit::Diamond))
                         .count();
                     g.mult += diamonds * 3
                 }
@@ -86,9 +87,9 @@ impl JokerEffects for Jokers {
             Self::LustyJoker(_) => {
                 fn apply(g: &mut Game, hand: MadeHand) {
                     let hearts = g
-                        .non_debuffed(hand.hand.cards().iter())
+                        .non_debuffed(hand.scored_cards(g.has_splash()).iter())
                         .iter()
-                        .filter(|c| c.matches_suit(Suit::Heart))
+                        .filter(|c| g.matches_suit(*c, Suit::Heart))
                         .count();
                     g.mult += hearts * 3
                 }
@@ -97,9 +98,9 @@ impl JokerEffects for Jokers {
             Self::WrathfulJoker(_) => {
                 fn apply(g: &mut Game, hand: MadeHand) {
                     let spades = g
-                        .non_debuffed(hand.hand.cards().iter())
+                        .non_debuffed(hand.scored_cards(g.has_splash()).iter())
                         .iter()
-                        .filter(|c| c.matches_suit(Suit::Spade))
+                        .filter(|c| g.matches_suit(*c, Suit::Spade))
                         .count();
                     g.mult += spades * 3
                 }
@@ -108,9 +109,9 @@ impl JokerEffects for Jokers {
             Self::GluttonousJoker(_) => {
                 fn apply(g: &mut Game, hand: MadeHand) {
                     let clubs = g
-                        .non_debuffed(hand.hand.cards().iter())
+                        .non_debuffed(hand.scored_cards(g.has_splash()).iter())
                         .iter()
-                        .filter(|c| c.matches_suit(Suit::Club))
+                        .filter(|c| g.matches_suit(*c, Suit::Club))
                         .count();
                     g.mult += clubs * 3
                 }
@@ -142,7 +143,7 @@ impl JokerEffects for Jokers {
             }
             Self::CrazyJoker(_) => {
                 fn apply(g: &mut Game, hand: MadeHand) {
-                    if hand.hand.is_straight().is_some() {
+                    if hand_contains_straight(hand.rank) {
                         g.mult += 12
                     }
                 }
@@ -150,7 +151,7 @@ impl JokerEffects for Jokers {
             }
             Self::DrollJoker(_) => {
                 fn apply(g: &mut Game, hand: MadeHand) {
-                    if hand.hand.is_flush().is_some() {
+                    if hand_contains_flush(hand.rank) {
                         g.mult += 10
                     }
                 }
@@ -182,7 +183,7 @@ impl JokerEffects for Jokers {
             }
             Self::DeviousJoker(_) => {
                 fn apply(g: &mut Game, hand: MadeHand) {
-                    if hand.hand.is_straight().is_some() {
+                    if hand_contains_straight(hand.rank) {
                         g.chips += 100
                     }
                 }
@@ -190,7 +191,7 @@ impl JokerEffects for Jokers {
             }
             Self::CraftyJoker(_) => {
                 fn apply(g: &mut Game, hand: MadeHand) {
-                    if hand.hand.is_flush().is_some() {
+                    if hand_contains_flush(hand.rank) {
                         g.chips += 80
                     }
                 }
@@ -198,7 +199,7 @@ impl JokerEffects for Jokers {
             }
             Self::HalfJoker(_) => {
                 fn apply(g: &mut Game, hand: MadeHand) {
-                    if hand.hand.len() <= 3 {
+                    if hand.all.len() <= 3 {
                         g.mult += 20;
                     }
                 }
@@ -236,7 +237,7 @@ impl JokerEffects for Jokers {
             Self::RideTheBus(_) => {
                 fn apply(g: &mut Game, hand: MadeHand) {
                     let has_face = g
-                        .non_debuffed(hand.hand.cards().iter())
+                        .non_debuffed(hand.all.iter())
                         .iter()
                         .any(|c| g.is_face_card(c));
                     if has_face {
@@ -280,8 +281,7 @@ impl JokerEffects for Jokers {
                 let id = wee.instance_id;
                 let apply = move |g: &mut Game, hand: MadeHand| {
                     let twos = hand
-                        .hand
-                        .cards()
+                        .scored_cards(g.has_splash())
                         .iter()
                         .filter(|c| c.value == Value::Two)
                         .count();
@@ -315,7 +315,7 @@ impl JokerEffects for Jokers {
             }
             Self::Fibonacci(_) => {
                 fn apply(g: &mut Game, _hand: MadeHand) {
-                    for card in _hand.hand.cards() {
+                    for card in _hand.scored_cards(g.has_splash()) {
                         if card.value == Value::Ace
                             || card.value == Value::Two
                             || card.value == Value::Three
@@ -330,7 +330,7 @@ impl JokerEffects for Jokers {
             }
             Self::ScaryFace(_) => {
                 fn apply(g: &mut Game, _hand: MadeHand) {
-                    for card in g.non_debuffed(_hand.hand.cards().iter()) {
+                    for card in g.non_debuffed(_hand.scored_cards(g.has_splash()).iter()) {
                         if g.is_face_card(&card) {
                             g.chips += 30;
                         }
@@ -347,7 +347,7 @@ impl JokerEffects for Jokers {
             Self::Pareidolia(_) => vec![Effects::RuleFlag(RuleFlag::AllCardsAreFace)],
             Self::EvenSteven(_) => {
                 fn apply(g: &mut Game, _hand: MadeHand) {
-                    for card in _hand.hand.cards() {
+                    for card in _hand.scored_cards(g.has_splash()) {
                         if g.is_even(&card) {
                             g.mult += 4;
                         }
@@ -357,7 +357,7 @@ impl JokerEffects for Jokers {
             }
             Self::OddTodd(_) => {
                 fn apply(g: &mut Game, _hand: MadeHand) {
-                    for card in _hand.hand.cards() {
+                    for card in _hand.scored_cards(g.has_splash()) {
                         if g.is_odd(&card) {
                             g.chips += 31;
                         }
@@ -367,7 +367,7 @@ impl JokerEffects for Jokers {
             }
             Self::Scholar(_) => {
                 fn apply(g: &mut Game, _hand: MadeHand) {
-                    for card in _hand.hand.cards() {
+                    for card in _hand.scored_cards(g.has_splash()) {
                         if card.value == Value::Ace {
                             g.chips += 20;
                             g.mult += 4;
@@ -378,7 +378,7 @@ impl JokerEffects for Jokers {
             }
             Self::BusinessCard(_) => {
                 fn apply(g: &mut Game, _hand: MadeHand) {
-                    for card in g.non_debuffed(_hand.hand.cards().iter()) {
+                    for card in g.non_debuffed(_hand.scored_cards(g.has_splash()).iter()) {
                         if g.is_face_card(&card) && g.prob_roll(1, 2) {
                             g.money += 2;
                         }
@@ -409,27 +409,40 @@ impl JokerEffects for Jokers {
             }
             Self::MidasMask(_) => {
                 fn apply(g: &mut Game, hand: &mut MadeHand) {
-                    // only cards that are actually scored (hand.hand), not
-                    // unscored kickers (hand.all), become Gold
-                    let cards: Vec<Card> = hand
-                        .hand
-                        .cards()
-                        .into_iter()
-                        .map(|mut c| {
-                            if g.is_face_card(&c) && !g.is_card_debuffed(&c) {
-                                c.enhancement = Some(Enhancement::Gold);
-                                g.mutate_card(c.id, |c| c.enhancement = Some(Enhancement::Gold));
-                            }
-                            c
-                        })
+                    // Only cards that are actually scored become Gold. With
+                    // Splash every played card scores; otherwise kickers do
+                    // not.
+                    let scored: HashSet<usize> = hand
+                        .scored_cards(g.has_splash())
+                        .iter()
+                        .map(|card| card.id)
                         .collect();
-                    hand.hand = SelectHand::new(cards);
+                    for card in hand.all.iter_mut() {
+                        if scored.contains(&card.id)
+                            && g.is_face_card(card)
+                            && !g.is_card_debuffed(card)
+                        {
+                            card.enhancement = Some(Enhancement::Gold);
+                            g.mutate_card(card.id, |c| c.enhancement = Some(Enhancement::Gold));
+                        }
+                    }
+                    // Keep the made-hand subset unchanged; just refresh its
+                    // cards from the now-mutated play set.
+                    let made_ids: HashSet<usize> =
+                        hand.hand.cards().iter().map(|card| card.id).collect();
+                    let made: Vec<Card> = hand
+                        .all
+                        .iter()
+                        .filter(|card| made_ids.contains(&card.id))
+                        .cloned()
+                        .collect();
+                    hand.hand = SelectHand::new(made);
                 }
                 vec![Effects::OnModifyHand(Arc::new(Mutex::new(apply)))]
             }
             Self::Photograph(_) => {
                 fn apply(g: &mut Game, _hand: MadeHand) {
-                    for card in g.non_debuffed(_hand.hand.cards().iter()) {
+                    for card in g.non_debuffed(_hand.scored_cards(g.has_splash()).iter()) {
                         if g.is_face_card(&card) {
                             g.multiply_mult(2.0);
                             break;
@@ -469,7 +482,7 @@ impl JokerEffects for Jokers {
             }
             Self::WalkieTalkie(_) => {
                 fn apply(g: &mut Game, _hand: MadeHand) {
-                    for card in _hand.hand.cards() {
+                    for card in _hand.scored_cards(g.has_splash()) {
                         if card.value == Value::Ten || card.value == Value::Four {
                             g.chips += 10;
                             g.mult += 4;
@@ -480,7 +493,7 @@ impl JokerEffects for Jokers {
             }
             Self::SmileyFace(_) => {
                 fn apply(g: &mut Game, _hand: MadeHand) {
-                    for card in g.non_debuffed(_hand.hand.cards().iter()) {
+                    for card in g.non_debuffed(_hand.scored_cards(g.has_splash()).iter()) {
                         if g.is_face_card(&card) {
                             g.mult += 5;
                         }
@@ -490,7 +503,7 @@ impl JokerEffects for Jokers {
             }
             Self::GoldenTicket(_) => {
                 fn apply(g: &mut Game, _hand: MadeHand) {
-                    for card in _hand.hand.cards() {
+                    for card in _hand.scored_cards(g.has_splash()) {
                         if card.enhancement == Some(Enhancement::Gold) {
                             g.money += 4;
                         }
@@ -508,8 +521,8 @@ impl JokerEffects for Jokers {
             }
             Self::RoughGem(_) => {
                 fn apply(g: &mut Game, _hand: MadeHand) {
-                    for card in g.non_debuffed(_hand.hand.cards().iter()) {
-                        if card.matches_suit(Suit::Diamond) {
+                    for card in g.non_debuffed(_hand.scored_cards(g.has_splash()).iter()) {
+                        if g.matches_suit(&card, Suit::Diamond) {
                             g.money += 1;
                         }
                     }
@@ -518,8 +531,8 @@ impl JokerEffects for Jokers {
             }
             Self::Bloodstone(_) => {
                 fn apply(g: &mut Game, _hand: MadeHand) {
-                    for card in g.non_debuffed(_hand.hand.cards().iter()) {
-                        if card.matches_suit(Suit::Heart) && g.prob_roll(1, 2) {
+                    for card in g.non_debuffed(_hand.scored_cards(g.has_splash()).iter()) {
+                        if g.matches_suit(&card, Suit::Heart) && g.prob_roll(1, 2) {
                             g.multiply_mult(1.5);
                         }
                     }
@@ -528,8 +541,8 @@ impl JokerEffects for Jokers {
             }
             Self::Arrowhead(_) => {
                 fn apply(g: &mut Game, hand: MadeHand) {
-                    for card in g.non_debuffed(hand.hand.cards().iter()) {
-                        if card.matches_suit(Suit::Spade) {
+                    for card in g.non_debuffed(hand.scored_cards(g.has_splash()).iter()) {
+                        if g.matches_suit(&card, Suit::Spade) {
                             g.chips += 50;
                         }
                     }
@@ -538,8 +551,8 @@ impl JokerEffects for Jokers {
             }
             Self::OnyxAgate(_) => {
                 fn apply(g: &mut Game, hand: MadeHand) {
-                    for card in g.non_debuffed(hand.hand.cards().iter()) {
-                        if card.matches_suit(Suit::Club) {
+                    for card in g.non_debuffed(hand.scored_cards(g.has_splash()).iter()) {
+                        if g.matches_suit(&card, Suit::Club) {
                             g.mult += 7;
                         }
                     }
@@ -594,7 +607,7 @@ impl JokerEffects for Jokers {
             }
             Self::TheOrder(_) => {
                 fn apply(g: &mut Game, hand: MadeHand) {
-                    if hand.hand.is_straight().is_some() {
+                    if hand_contains_straight(hand.rank) {
                         g.multiply_mult(3.0);
                     }
                 }
@@ -602,7 +615,7 @@ impl JokerEffects for Jokers {
             }
             Self::TheTribe(_) => {
                 fn apply(g: &mut Game, hand: MadeHand) {
-                    if hand.hand.is_flush().is_some() {
+                    if hand_contains_flush(hand.rank) {
                         g.multiply_mult(2.0);
                     }
                 }
@@ -762,7 +775,7 @@ impl JokerEffects for Jokers {
                     let count = g
                         .non_debuffed(g.discarded_this_round.iter())
                         .iter()
-                        .filter(|c| c.matches_suit(suit))
+                        .filter(|c| g.matches_suit(*c, suit))
                         .count();
                     g.chips += count * 3;
                 };
@@ -798,6 +811,31 @@ impl JokerEffects for Jokers {
                     }
                 }
                 vec![Effects::OnScore(Arc::new(Mutex::new(apply)))]
+            }
+            Self::FourFingers(_) => vec![Effects::RuleFlag(RuleFlag::FourFingers)],
+            Self::Shortcut(_) => vec![Effects::RuleFlag(RuleFlag::Shortcut)],
+            Self::SmearedJoker(_) => vec![Effects::RuleFlag(RuleFlag::Smeared)],
+            Self::Splash(_) => vec![Effects::RuleFlag(RuleFlag::Splash)],
+            Self::Blueprint(_) | Self::Brainstorm(_) => copy_effects(game, self, 3),
+            Self::Seltzer(seltzer) => {
+                let id = seltzer.instance_id;
+                let trigger = move |g: &mut Game, _card: Card, _first: bool| -> usize {
+                    if g.jokers
+                        .iter()
+                        .find(|j| j.instance_id() == id)
+                        .map(|j| j.state().counter)
+                        .unwrap_or(0.0)
+                        > 0.0
+                    {
+                        1
+                    } else {
+                        0
+                    }
+                };
+                // The per-hand counter decrement is centralized in
+                // Game::calc_score_inner so copied retrigger effects do not
+                // decrement it more than once.
+                vec![Effects::TriggerCountPlayed(Arc::new(Mutex::new(trigger)))]
             }
             _ => vec![],
         }
@@ -880,7 +918,62 @@ impl JokerEffects for Jokers {
                 | Self::Luchador(_)
                 | Self::Chicot(_)
                 | Self::Matador(_)
+                | Self::FourFingers(_)
+                | Self::Shortcut(_)
+                | Self::SmearedJoker(_)
+                | Self::Splash(_)
+                | Self::Blueprint(_)
+                | Self::Brainstorm(_)
+                | Self::Seltzer(_)
         )
+    }
+}
+
+fn hand_contains_straight(rank: HandRank) -> bool {
+    matches!(
+        rank,
+        HandRank::Straight | HandRank::StraightFlush | HandRank::RoyalFlush
+    )
+}
+
+fn hand_contains_flush(rank: HandRank) -> bool {
+    matches!(
+        rank,
+        HandRank::Flush
+            | HandRank::StraightFlush
+            | HandRank::RoyalFlush
+            | HandRank::FlushHouse
+            | HandRank::FlushFive
+    )
+}
+
+fn copy_effects(game: &Game, source: &Jokers, depth: usize) -> Vec<Effects> {
+    if depth == 0 {
+        return Vec::new();
+    }
+    let Some(index) = game
+        .jokers
+        .iter()
+        .position(|joker| joker.instance_id() == source.instance_id())
+    else {
+        return Vec::new();
+    };
+
+    let target = match source {
+        Jokers::Blueprint(_) => game.jokers.get(index + 1),
+        Jokers::Brainstorm(_) => game.jokers.first(),
+        _ => None,
+    };
+    let Some(target) = target else {
+        return Vec::new();
+    };
+    if target.instance_id() == source.instance_id() {
+        return Vec::new();
+    }
+
+    match target {
+        Jokers::Blueprint(_) | Jokers::Brainstorm(_) => copy_effects(game, target, depth - 1),
+        _ => target.effects(game),
     }
 }
 
@@ -943,9 +1036,9 @@ mod tests {
     // `effects()` behavior implemented. Shop/pack generation
     // must never offer joker that silently does nothing.
     #[test]
-    fn test_exactly_74_jokers_implemented() {
+    fn test_exactly_81_jokers_implemented() {
         let count = Jokers::iter().filter(|j| j.is_implemented()).count();
-        assert_eq!(count, 74);
+        assert_eq!(count, 81);
     }
 
     #[test]
