@@ -33,6 +33,9 @@ pub struct Card {
     pub edition: Edition,
     pub enhancement: Option<Enhancement>,
     pub seal: Option<Seal>,
+    /// Permanent bonus chips (Hiker and similar effects).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub bonus_chips: i32,
 }
 
 impl Card {
@@ -45,6 +48,7 @@ impl Card {
             edition: Edition::Base,
             enhancement: None,
             seal: None,
+            bonus_chips: 0,
         }
     }
 
@@ -82,7 +86,7 @@ impl Card {
         if self.enhancement == Some(Enhancement::Stone) {
             return 0;
         }
-        match self.value {
+        let base = match self.value {
             Value::Two => 2,
             Value::Three => 3,
             Value::Four => 4,
@@ -96,7 +100,8 @@ impl Card {
             Value::Queen => 10,
             Value::King => 10,
             Value::Ace => 11,
-        }
+        };
+        (base as i32 + self.bonus_chips).max(0) as usize
     }
 
     /// Price when the Magic Trick voucher puts this card up for sale.

@@ -34,6 +34,8 @@ pub mod stage;
 pub mod tag;
 pub mod tarot;
 pub mod voucher;
+#[cfg(test)]
+mod wave2_tests;
 
 #[cfg(test)]
 mod tests {
@@ -263,7 +265,10 @@ mod tests {
             Spectral::Talisman,
         )));
         assert!(matches!(res, Err(GameError::InvalidAction)));
-        assert_eq!(g.consumables, vec![Consumable::Spectral(Spectral::Talisman)]);
+        assert_eq!(
+            g.consumables,
+            vec![Consumable::Spectral(Spectral::Talisman)]
+        );
         assert_eq!(g.stage, Stage::Shop());
         assert_eq!(g.available.cards().len(), 0);
     }
@@ -305,7 +310,9 @@ mod tests {
         g.consumables.push(Consumable::Tarot(Tarot::Fool));
         g.handle_action(Action::UseConsumable(Consumable::Tarot(Tarot::Fool)))
             .unwrap();
-        assert!(g.consumables.contains(&Consumable::Planet(Planets::Mercury)));
+        assert!(g
+            .consumables
+            .contains(&Consumable::Planet(Planets::Mercury)));
         assert!(
             !g.consumables
                 .iter()
@@ -329,12 +336,17 @@ mod tests {
             Spectral::Familiar,
         )));
         assert!(matches!(res, Err(GameError::InvalidAction)));
-        assert_eq!(g.consumables, vec![Consumable::Spectral(Spectral::Familiar)]);
+        assert_eq!(
+            g.consumables,
+            vec![Consumable::Spectral(Spectral::Familiar)]
+        );
 
         let actions: Vec<Action> = g.gen_actions().collect();
-        assert!(!actions.contains(&Action::UseConsumable(Consumable::Spectral(
-            Spectral::Familiar
-        ))));
+        assert!(
+            !actions.contains(&Action::UseConsumable(Consumable::Spectral(
+                Spectral::Familiar
+            )))
+        );
     }
 
     #[test]
@@ -346,7 +358,11 @@ mod tests {
         g.consumables = vec![Consumable::Spectral(Spectral::Sigil)];
         let actions: Vec<Action> = g.gen_actions().collect();
         // Sigil is 0-target but still touches the hand, so it's not offered from Shop.
-        assert!(!actions.contains(&Action::UseConsumable(Consumable::Spectral(Spectral::Sigil))));
+        assert!(
+            !actions.contains(&Action::UseConsumable(Consumable::Spectral(
+                Spectral::Sigil
+            )))
+        );
     }
 
     #[test]

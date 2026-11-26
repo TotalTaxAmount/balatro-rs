@@ -5,12 +5,12 @@ use crate::card::{card_display, Card, Edition, Enhancement, Seal, Suit};
 use crate::config::{Config, RngMode};
 use crate::consumable::Consumable;
 use crate::deck::Deck;
-use crate::effect::{EffectRegistry, Effects, RuleFlag};
+use crate::effect::{EffectRegistry, Effects, GameEvent, RuleFlag};
 use crate::error::GameError;
 use crate::hand::{HandRules, MadeHand, SelectHand};
 use crate::joker::{joker_display, JokerEffects, JokerState, Jokers};
 use crate::pack::{OpenPackState, Pack, PackCategory, PackContent};
-use crate::planet::Planetarium;
+use crate::planet::{Planetarium, Planets};
 use crate::rank::HandRank;
 use crate::rng::{Backend, FastBackend, RealBackend, RngBackend};
 use crate::score::{ScoreSource, ScoreStep, ScoreTrace};
@@ -142,6 +142,14 @@ pub struct Game {
     pub(crate) prob_script: Vec<bool>,
     #[cfg_attr(feature = "serde", serde(skip))]
     pub(crate) prob_script_pos: usize,
+    /// Uniform integer ranges sampled in `Count` mode.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) range_trace: Vec<(f64, f64)>,
+    /// Forced range values for exact min/EV/max passes.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) range_script: Vec<f64>,
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) range_script_pos: usize,
     /// When set, `required_score` returns this instead of deriving the target
     /// from the ante table. Used when mirroring a live game, where the client
     /// is the authority on the current blind's target.
@@ -167,6 +175,52 @@ pub struct Game {
     // set when a boss's ability actually triggered (Matador's trigger condition).
     #[cfg_attr(feature = "serde", serde(default))]
     pub(crate) boss_triggered_this_hand: bool,
+
+    // --- Wave 2 run statistics / lifecycle tracking ---
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub total_hands_played: usize,
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub hands_played_this_round: usize,
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub skips: usize,
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub rerolls_this_shop: usize,
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub packs_skipped: usize,
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub cards_sold: usize,
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub jokers_sold: usize,
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub cards_added: usize,
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub cards_destroyed: usize,
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub bosses_defeated: usize,
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub tarots_used: usize,
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub planets_used: HashSet<Planets>,
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub consumable_sell_bonus: usize,
+    /// Temporary draw adjustment for DNA/Sixth Sense (never persisted).
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) draw_adjust: isize,
+    /// Debt carried with Credit Card (money itself stays non-negative).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub debt: usize,
+    /// Consumables copied by Perkeo; they do not use a consumable slot.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub negative_consumables: Vec<Consumable>,
+    /// Free rerolls remaining in the current shop (Chaos).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub free_rerolls: usize,
+    /// Event dispatch state: nested emits are queued so handlers never
+    /// re-lock their own mutex.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) emitting: bool,
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) event_queue: Vec<GameEvent>,
 
     pub last_consumable_used: Option<Consumable>,
     #[cfg_attr(feature = "serde", serde(default))]
@@ -256,6 +310,9 @@ impl Game {
             prob_trace: Vec::new(),
             prob_script: Vec::new(),
             prob_script_pos: 0,
+            range_trace: Vec::new(),
+            range_script: Vec::new(),
+            range_script_pos: 0,
             required_score_override: None,
             hand_ranks_played_this_round: HashSet::new(),
             consecutive_hands_without_face_card: 0,
@@ -264,6 +321,25 @@ impl Game {
             total_cards_discarded: 0,
             boss_disabled_by_luchador: false,
             boss_triggered_this_hand: false,
+            total_hands_played: 0,
+            hands_played_this_round: 0,
+            skips: 0,
+            rerolls_this_shop: 0,
+            packs_skipped: 0,
+            cards_sold: 0,
+            jokers_sold: 0,
+            cards_added: 0,
+            cards_destroyed: 0,
+            bosses_defeated: 0,
+            tarots_used: 0,
+            planets_used: HashSet::new(),
+            consumable_sell_bonus: 0,
+            draw_adjust: 0,
+            debt: 0,
+            negative_consumables: Vec::new(),
+            free_rerolls: 0,
+            emitting: false,
+            event_queue: Vec::new(),
             last_consumable_used: None,
             last_score: 0,
             reroll_cost: default_reroll_cost(),
@@ -305,9 +381,49 @@ impl Game {
 
     /// Hand size dealt each round — Paint Brush / Palette raise the
     /// baseline; Manacle (while active) then subtracts one from that.
+    /// Hand-size delta from owned jokers. `config.available` is the base
+    /// value; keep this in sync with the live-state parser.
+    pub fn joker_hand_delta(&self) -> isize {
+        let mut delta = 0isize;
+        for joker in &self.jokers {
+            match joker {
+                Jokers::Juggler(_) => delta += 1,
+                Jokers::Troubadour(_) => delta += 2,
+                Jokers::Stuntman(_) => delta -= 2,
+                Jokers::MerryAndy(_) => delta -= 1,
+                Jokers::TurtleBean(_) => delta += joker.state().counter as isize,
+                _ => {}
+            }
+        }
+        delta
+    }
+
+    pub fn joker_play_delta(&self) -> isize {
+        self.jokers
+            .iter()
+            .filter(|j| matches!(j, Jokers::Troubadour(_)))
+            .count() as isize
+            * -1
+    }
+
+    pub fn joker_discard_delta(&self) -> isize {
+        let mut delta = 0isize;
+        for joker in &self.jokers {
+            match joker {
+                Jokers::Drunkard(_) => delta += 1,
+                Jokers::MerryAndy(_) => delta += 3,
+                _ => {}
+            }
+        }
+        delta
+    }
+
     pub fn hand_size(&self) -> usize {
-        let base = (self.config.available + self.vouchers.hand_size_bonus())
-            .min(self.config.available_max);
+        let base = Self::apply_delta(
+            self.config.available,
+            self.vouchers.hand_size_bonus() as isize + self.joker_hand_delta(),
+        )
+        .min(self.config.available_max);
         if self.active_boss() == Some(BossBlind::Manacle) {
             base.saturating_sub(1)
         } else {
@@ -330,13 +446,20 @@ impl Game {
     /// Hands per round — Grabber/Nacho Tong add, Hieroglyph subtracts.
     /// Never drops below one; a run with no hands is unplayable.
     pub fn plays_per_round(&self) -> usize {
-        Self::apply_delta(self.config.plays, self.vouchers.hands_delta()).max(1)
+        Self::apply_delta(
+            self.config.plays,
+            self.vouchers.hands_delta() + self.joker_play_delta(),
+        )
+        .max(1)
     }
 
     /// Discards per round — Wasteful/Recyclomancy add, Petroglyph
     /// subtracts. May legitimately reach zero.
     pub fn discards_per_round(&self) -> usize {
-        Self::apply_delta(self.config.discards, self.vouchers.discards_delta())
+        Self::apply_delta(
+            self.config.discards,
+            self.vouchers.discards_delta() + self.joker_discard_delta(),
+        )
     }
 
     /// Interest cap at cash out — Seed Money / Money Tree raise it.
@@ -395,6 +518,8 @@ impl Game {
             }
         }
 
+        self.emit(GameEvent::RoundEnd);
+
         let planetarium = self.planetarium.clone();
         for card in self.available.not_selected() {
             let triggers = self.trigger_count_held(&card);
@@ -420,6 +545,7 @@ impl Game {
         self.discards_remaining = self.discards_per_round();
         self.hand_ranks_played_this_round.clear();
         self.discarded_this_round.clear();
+        self.hands_played_this_round = 0;
         self.boss_disabled_by_luchador = false;
         self.deck.append(&mut self.discarded);
         self.deck.extend(self.available.cards());
@@ -516,10 +642,19 @@ impl Game {
             return Err(GameError::NoRemainingPlays);
         }
         self.plays -= 1;
+        let first_hand = self.hands_played_this_round == 0;
         let selected = SelectHand::new(self.available.selected());
         let best = selected.best_hand_with_rules(self.hand_rules())?;
         let scored = best.clone();
         let score = self.calc_score(best);
+        self.total_hands_played += 1;
+        self.hands_played_this_round += 1;
+        self.emit(GameEvent::HandPlayed {
+            rank: scored.rank,
+            played: scored.all.clone(),
+            scored: scored.scored_cards(self.has_splash()),
+            first: first_hand,
+        });
         let clear_blind = self.handle_score(score)?;
         // must run before the discard/redraw below: self.available still reflects
         // the cards actually held when the round ended, not their replacements.
@@ -528,14 +663,16 @@ impl Game {
         }
         self.discarded.extend(self.available.selected());
         let removed = self.available.remove_selected();
-        let n = if self.active_boss() == Some(BossBlind::Serpent) {
+        let mut n = if self.active_boss() == Some(BossBlind::Serpent) {
             3
         } else {
             removed
         };
+        n = (n as isize + self.draw_adjust).max(0) as usize;
+        self.draw_adjust = 0;
         self.draw(n);
         self.check_out_of_cards();
-        for card in scored.hand.cards() {
+        for card in scored.scored_cards(self.has_splash()) {
             if card.enhancement == Some(Enhancement::Glass) && self.prob_roll(1, 4) {
                 self.destroy_card(card.id);
             }
@@ -581,23 +718,44 @@ impl Game {
             }
         }
 
+        let rank = SelectHand::new(discarded.clone())
+            .best_hand_with_rules(self.hand_rules())
+            .map(|made| made.rank)
+            .unwrap_or(HandRank::HighCard);
+        let first_discard = self.discards_remaining + 1 == self.discards_per_round();
         let hand = MadeHand {
             hand: SelectHand::new(discarded.clone()),
-            rank: HandRank::HighCard,
-            all: discarded,
+            rank,
+            all: discarded.clone(),
         };
         for e in self.effect_registry.on_discard.clone() {
             if let Effects::OnDiscard(f) = e {
                 f.lock().unwrap()(self, hand.clone())
             }
         }
+        self.emit(GameEvent::Discard {
+            rank,
+            discarded,
+            first: first_discard,
+        });
         Ok(())
     }
 
     pub(crate) fn destroy_card(&mut self, id: usize) {
+        let destroyed = self
+            .available
+            .cards()
+            .into_iter()
+            .chain(self.deck.cards())
+            .chain(self.discarded.iter().copied())
+            .find(|card| card.id == id);
         self.available.remove_by_id(id);
         self.deck.remove_by_id(id);
         self.discarded.retain(|c| c.id != id);
+        if let Some(card) = destroyed {
+            self.cards_destroyed += 1;
+            self.emit(GameEvent::CardDestroyed(card));
+        }
     }
 
     pub(crate) fn mutate_card<F: Fn(&mut Card) + Copy>(&mut self, id: usize, f: F) {
@@ -610,6 +768,84 @@ impl Game {
             .iter_mut()
             .find(|j| j.instance_id() == id)
             .map(|j| j.state_mut())
+    }
+
+    /// Fire a lifecycle event at every joker subscribed to `OnEvent`.
+    ///
+    /// Events raised while a handler is running are queued and delivered
+    /// afterwards; otherwise a nested event would deadlock on the handler's
+    /// own mutex.
+    pub(crate) fn emit(&mut self, event: GameEvent) {
+        self.event_queue.push(event);
+        if self.emitting {
+            return;
+        }
+        self.emitting = true;
+        while !self.event_queue.is_empty() {
+            let event = self.event_queue.remove(0);
+            for e in self.effect_registry.on_event.clone() {
+                if let Effects::OnEvent(f) = e {
+                    f.lock().unwrap()(self, event.clone());
+                }
+            }
+        }
+        self.emitting = false;
+    }
+
+    pub(crate) fn register_jokers(&mut self) {
+        let jokers = self.jokers.clone();
+        self.effect_registry.register_jokers(jokers, &self.clone());
+        self.backend.set_showman(self.has_showman());
+    }
+
+    /// Add a playing card to the deck and notify deck-growth jokers.
+    pub(crate) fn add_card_to_deck(&mut self, card: Card) {
+        self.deck.push(card);
+        self.cards_added += 1;
+        self.emit(GameEvent::CardAdded(card));
+    }
+
+    /// Remove a joker from the lineup and refresh cached effects.
+    pub(crate) fn destroy_joker_at(&mut self, idx: usize) -> Option<Jokers> {
+        if idx >= self.jokers.len() {
+            return None;
+        }
+        let joker = self.jokers.remove(idx);
+        self.register_jokers();
+        Some(joker)
+    }
+
+    pub(crate) fn add_owned_joker(&mut self, joker: Jokers) -> bool {
+        if self.jokers.len() >= self.joker_slots() {
+            return false;
+        }
+        self.jokers.push(joker);
+        self.register_jokers();
+        true
+    }
+
+    pub(crate) fn add_random_tarot(&mut self) {
+        if self.consumables.len() >= self.consumable_slots() {
+            return;
+        }
+        let excl: Vec<Tarot> = self
+            .consumables
+            .iter()
+            .filter_map(|c| match c {
+                Consumable::Tarot(t) => Some(*t),
+                _ => None,
+            })
+            .collect();
+        let tarot = self.backend.roll_random_tarot(&excl);
+        self.consumables.push(tarot);
+    }
+
+    pub(crate) fn add_random_spectral(&mut self) {
+        if self.consumables.len() >= self.consumable_slots() {
+            return;
+        }
+        let spectral = self.backend.roll_random_spectral();
+        self.consumables.push(Consumable::Spectral(spectral));
     }
 
     pub(crate) fn is_face_card(&self, card: &Card) -> bool {
@@ -727,6 +963,15 @@ impl Game {
     }
 
     pub fn prob_roll(&mut self, numerator: u32, denominator: u32) -> bool {
+        let numerator = if self
+            .effect_registry
+            .rule_flags
+            .contains(&RuleFlag::DoubleProb)
+        {
+            numerator.saturating_mul(2)
+        } else {
+            numerator
+        };
         let numerator = numerator.saturating_mul(self.prob_mult);
         match self.prob_mode {
             ProbMode::Sampled => self.backend.prob_roll(numerator, denominator),
@@ -742,6 +987,82 @@ impl Game {
                     .unwrap_or(false);
                 self.prob_script_pos += 1;
                 outcome
+            }
+        }
+    }
+
+    /// Cash minus debt. Negative only while Credit Card is held.
+    pub fn available_money(&self) -> i64 {
+        self.money as i64 - self.debt as i64
+    }
+
+    pub fn credit_limit(&self) -> i64 {
+        let limit = self
+            .jokers
+            .iter()
+            .filter(|j| matches!(j, Jokers::CreditCard(_)))
+            .count() as i64
+            * 20;
+        limit
+    }
+
+    fn ensure_affordable(&self, cost: usize) -> Result<(), GameError> {
+        if cost <= self.money {
+            return Ok(());
+        }
+        let shortfall = (cost - self.money) as i64;
+        if (self.debt as i64 + shortfall) > self.credit_limit() {
+            return Err(GameError::InvalidBalance);
+        }
+        Ok(())
+    }
+
+    /// Spend cash, dipping into debt only up to the Credit Card limit.
+    pub(crate) fn spend(&mut self, cost: usize) -> Result<(), GameError> {
+        if cost <= self.money {
+            self.money -= cost;
+            return Ok(());
+        }
+        let shortfall = (cost - self.money) as i64;
+        if (self.debt as i64 + shortfall) > self.credit_limit() {
+            return Err(GameError::InvalidBalance);
+        }
+        self.debt += shortfall as usize;
+        self.money = 0;
+        Ok(())
+    }
+
+    fn has_showman(&self) -> bool {
+        self.jokers.iter().any(|j| matches!(j, Jokers::Showman(_)))
+    }
+
+    fn has_astronomer(&self) -> bool {
+        self.jokers
+            .iter()
+            .any(|j| matches!(j, Jokers::Astronomer(_)))
+    }
+
+    /// Uniform random value in `[min, max]`. `Count` records the range,
+    /// `Sampled` draws, and `Scripted` consumes a forced value.
+    pub fn random_range(&mut self, min: f64, max: f64) -> f64 {
+        match self.prob_mode {
+            ProbMode::Sampled => {
+                let lo = min.floor() as i64;
+                let hi = max.ceil() as i64;
+                self.backend.roll_int(lo.max(0) as u32, hi.max(0) as u32) as f64
+            }
+            ProbMode::Count => {
+                self.range_trace.push((min, max));
+                min
+            }
+            ProbMode::Scripted => {
+                let value = self
+                    .range_script
+                    .get(self.range_script_pos)
+                    .copied()
+                    .unwrap_or(min);
+                self.range_script_pos += 1;
+                value
             }
         }
     }
@@ -784,10 +1105,12 @@ impl Game {
         counter.plays = self.plays.saturating_sub(1);
         counter.prob_mode = ProbMode::Count;
         counter.prob_trace.clear();
+        counter.range_trace.clear();
         let _ = counter.calc_score(made.clone());
         let triggers = counter.prob_trace.clone();
+        let ranges = counter.range_trace.clone();
 
-        if triggers.is_empty() {
+        if triggers.is_empty() && ranges.is_empty() {
             let mut game = self.clone();
             game.available = available;
             game.plays = self.plays.saturating_sub(1);
@@ -802,6 +1125,36 @@ impl Game {
                 triggers: 0,
                 exact: true,
                 jokers_after: game.jokers.clone(),
+            });
+        }
+
+        // Uniform ranges (Misprint) are linear in Mult, so min/EV/max are
+        // exact with three scripted passes.
+        if triggers.is_empty() && !ranges.is_empty() {
+            let run = |values: Vec<f64>| {
+                let mut game = self.clone();
+                game.available = available.clone();
+                game.plays = self.plays.saturating_sub(1);
+                game.prob_mode = ProbMode::Scripted;
+                game.prob_script.clear();
+                game.prob_script_pos = 0;
+                game.range_script = values;
+                game.range_script_pos = 0;
+                let score = game.calc_score(made.clone());
+                let money = game.money as i64 - self.money as i64;
+                (score, money, game.jokers.clone())
+            };
+            let min = run(ranges.iter().map(|(min, _)| *min).collect());
+            let max = run(ranges.iter().map(|(_, max)| *max).collect());
+            let mid = run(ranges.iter().map(|(min, max)| (min + max) / 2.0).collect());
+            return Some(ScoreEvaluation {
+                score: mid.0 as f64,
+                money_delta: mid.1 as f64,
+                min_score: min.0,
+                max_score: max.0,
+                triggers: ranges.len(),
+                exact: true,
+                jokers_after: mid.2,
             });
         }
 
@@ -824,6 +1177,8 @@ impl Game {
                     .map(|index| (mask >> index) & 1 == 1)
                     .collect();
                 game.prob_script_pos = 0;
+                game.range_script = ranges.iter().map(|(min, max)| (min + max) / 2.0).collect();
+                game.range_script_pos = 0;
 
                 let score = game.calc_score(made.clone());
                 let money_delta = game.money as i64 - self.money as i64;
@@ -853,7 +1208,7 @@ impl Game {
                 money_delta: expected_money,
                 min_score,
                 max_score,
-                triggers: triggers.len(),
+                triggers: triggers.len() + ranges.len(),
                 exact: true,
                 jokers_after,
             });
@@ -972,6 +1327,9 @@ impl Game {
     ) -> usize {
         self.boss_triggered_this_hand = false;
 
+        // Space Joker upgrades the hand before its base chips/mult are read.
+        self.emit(GameEvent::BeforeScore(hand.rank));
+
         // compute chips and mult from hand level
         let chips_before = self.chips;
         let mult_before = self.mult;
@@ -1067,11 +1425,17 @@ impl Game {
                     Some(Enhancement::Mult) => self.mult += 4,
                     Some(Enhancement::Glass) => self.multiply_mult(self.glass_x_mult),
                     Some(Enhancement::Lucky) => {
+                        let mut triggered = false;
                         if self.prob_roll(1, 5) {
                             self.mult += 20;
+                            triggered = true;
                         }
                         if self.prob_roll(1, 15) {
                             self.money += 20;
+                            triggered = true;
+                        }
+                        if triggered {
+                            self.emit(GameEvent::LuckyTriggered);
                         }
                     }
                     _ => {}
@@ -1287,8 +1651,27 @@ impl Game {
         }
     }
 
+    /// Mr. Bones saves a losing final hand when at least 25% of the target
+    /// was scored. The joker destroys itself.
+    fn try_mr_bones(&mut self) -> bool {
+        if self.score.saturating_mul(4) < self.required_score() {
+            return false;
+        }
+        if let Some(idx) = self
+            .jokers
+            .iter()
+            .position(|joker| matches!(joker, Jokers::MrBones(_)))
+        {
+            self.destroy_joker_at(idx);
+            true
+        } else {
+            false
+        }
+    }
+
     fn calc_reward(&mut self, blind: Blind) -> Result<usize, GameError> {
-        let mut interest = (self.money as f32 * self.config.interest_rate).floor() as usize;
+        let mut interest =
+            (self.available_money().max(0) as f32 * self.config.interest_rate).floor() as usize;
         let interest_max = self.interest_max();
         if interest > interest_max {
             interest = interest_max
@@ -1332,10 +1715,27 @@ impl Game {
         for tag in std::mem::take(&mut self.tags) {
             self.apply_tag(tag);
         }
-        self.money += self.reward;
+        let net = self.available_money() + self.reward as i64;
+        if net >= 0 {
+            self.money = net as usize;
+            self.debt = 0;
+        } else {
+            self.money = 0;
+            self.debt = (-net) as usize;
+        }
         self.reward = 0;
         self.reroll_cost = self.base_reroll_cost();
         self.stage = Stage::Shop();
+        self.free_rerolls = if self
+            .jokers
+            .iter()
+            .any(|j| matches!(j, Jokers::ChaosTheClown(_)))
+        {
+            1
+        } else {
+            0
+        };
+        self.backend.set_showman(self.has_showman());
         self.refresh_voucher_offer();
         let planetarium = self.planetarium.clone();
         let held_consumables = self.consumables.clone();
@@ -1366,11 +1766,14 @@ impl Game {
         if self.stage != Stage::Shop() {
             return Err(GameError::InvalidStage);
         }
-        if self.money < self.reroll_cost {
-            return Err(GameError::InvalidBalance);
+        if self.free_rerolls > 0 {
+            self.free_rerolls -= 1;
+        } else {
+            self.spend(self.reroll_cost)?;
+            self.reroll_cost += 1;
         }
-        self.money -= self.reroll_cost;
-        self.reroll_cost += 1;
+        self.rerolls_this_shop += 1;
+        self.emit(GameEvent::Reroll);
         let planetarium = self.planetarium.clone();
         let mut held = self.consumables.clone();
         held.extend(self.shop.consumables.clone());
@@ -1393,6 +1796,7 @@ impl Game {
         }
         self.money += self.jokers[idx].sell_value();
         let sold = self.jokers.remove(idx);
+        self.jokers_sold += 1;
         for e in sold.effects(self) {
             if let Effects::OnSell(f) = e {
                 f.lock().unwrap()(self);
@@ -1414,6 +1818,7 @@ impl Game {
         }
         self.effect_registry
             .register_jokers(self.jokers.clone(), &self.clone());
+        self.emit(GameEvent::JokerSold(sold));
         Ok(())
     }
 
@@ -1424,7 +1829,8 @@ impl Game {
         if idx >= self.consumables.len() {
             return Err(GameError::InvalidAction);
         }
-        self.money += self.consumables[idx].sell_value();
+        self.money += self.consumables[idx].sell_value() + self.consumable_sell_bonus;
+        self.cards_sold += 1;
         self.consumables.remove(idx);
         Ok(())
     }
@@ -1440,11 +1846,10 @@ impl Game {
         if self.jokers.len() >= self.joker_slots() {
             return Err(GameError::NoAvailableSlot);
         }
-        if self.price(joker.cost()) > self.money {
-            return Err(GameError::InvalidBalance);
-        }
+        let cost = self.price(joker.cost());
+        self.ensure_affordable(cost)?;
         self.shop.buy_joker(&joker)?;
-        self.money -= self.price(joker.cost());
+        self.spend(cost)?;
         self.backend.on_joker_bought(&joker);
         initialize_new_joker(&mut joker);
         self.jokers.push(joker);
@@ -1460,11 +1865,14 @@ impl Game {
         if self.consumables.len() >= self.consumable_slots() {
             return Err(GameError::NoAvailableSlot);
         }
-        if self.price(consumable.cost()) > self.money {
-            return Err(GameError::InvalidBalance);
-        }
+        let cost = if self.has_astronomer() && matches!(consumable, Consumable::Planet(_)) {
+            0
+        } else {
+            self.price(consumable.cost())
+        };
+        self.ensure_affordable(cost)?;
         self.shop.buy_consumable(&consumable)?;
-        self.money -= self.price(consumable.cost());
+        self.spend(cost)?;
         self.consumables.push(consumable);
         Ok(())
     }
@@ -1529,12 +1937,10 @@ impl Game {
             return Err(GameError::NoAvailableSlot);
         }
         let cost = self.price(card.shop_cost());
-        if cost > self.money {
-            return Err(GameError::InvalidBalance);
-        }
+        self.ensure_affordable(cost)?;
         let bought = self.shop.buy_card(&card)?;
-        self.money -= cost;
-        self.deck.push(bought);
+        self.spend(cost)?;
+        self.add_card_to_deck(bought);
         Ok(())
     }
 
@@ -1570,12 +1976,18 @@ impl Game {
                 }
             }
         }
-        let i = self
-            .consumables
+        let normal = self.consumables.iter().position(|c| c == &consumable);
+        if let Some(i) = normal {
+            self.consumables.remove(i);
+        } else if let Some(i) = self
+            .negative_consumables
             .iter()
             .position(|c| c == &consumable)
-            .ok_or(GameError::InvalidAction)?;
-        self.consumables.remove(i);
+        {
+            self.negative_consumables.remove(i);
+        } else {
+            return Err(GameError::InvalidAction);
+        }
         match consumable {
             Consumable::Planet(planet) => {
                 self.planetarium.level_up(planet.hand_rank());
@@ -1592,6 +2004,16 @@ impl Game {
                 s.apply(self)?;
             }
         }
+        match &consumable {
+            Consumable::Planet(planet) => {
+                self.planets_used.insert(*planet);
+            }
+            Consumable::Tarot(_) => {
+                self.tarots_used += 1;
+            }
+            Consumable::Spectral(_) => {}
+        }
+        self.emit(GameEvent::ConsumableUsed(consumable));
         Ok(())
     }
 
@@ -1665,11 +2087,14 @@ impl Game {
         if self.stage != Stage::Shop() {
             return Err(GameError::InvalidStage);
         }
-        if self.price(pack.cost()) > self.money {
-            return Err(GameError::InvalidBalance);
-        }
+        let cost = if self.has_astronomer() && pack.category == PackCategory::Celestial {
+            0
+        } else {
+            self.price(pack.cost())
+        };
+        self.ensure_affordable(cost)?;
         self.shop.buy_pack(&pack)?;
-        self.money -= self.price(pack.cost());
+        self.spend(cost)?;
 
         // Arcana/Spectral packs draw a hand for the player to apply targeted
         // tarots/spectrals against
@@ -1683,6 +2108,7 @@ impl Game {
             contents: pack.contents,
         });
         self.stage = Stage::PackOpen();
+        self.emit(GameEvent::PackOpened);
         Ok(())
     }
 
@@ -1740,7 +2166,7 @@ impl Game {
                     .register_jokers(self.jokers.clone(), &self.clone());
             }
             PackContent::PlayingCard(c) => {
-                self.deck.push(c);
+                self.add_card_to_deck(c);
             }
             PackContent::Spectral(s) => {
                 s.apply(self)?;
@@ -1765,6 +2191,8 @@ impl Game {
         if self.stage != Stage::PackOpen() {
             return Err(GameError::InvalidStage);
         }
+        self.packs_skipped += 1;
+        self.emit(GameEvent::PackSkipped);
         self.finish_pack();
         Ok(())
     }
@@ -1806,8 +2234,10 @@ impl Game {
         // has to count for the round it was bought for.
         self.plays = self.plays_per_round();
         self.discards_remaining = self.discards_per_round();
+        self.hands_played_this_round = 0;
         self.deal();
         self.check_out_of_cards();
+        self.emit(GameEvent::BlindSelected(blind));
         Ok(())
     }
 
@@ -1827,6 +2257,7 @@ impl Game {
         }
         self.blind = Some(blind);
         self.stage = Stage::PreBlind();
+        self.skips += 1;
         let tag = self
             .skip_tag(blind)
             .expect("blind is not Boss, checked above");
@@ -1855,11 +2286,13 @@ impl Game {
     fn next_round(&mut self) -> Result<(), GameError> {
         self.stage = Stage::PreBlind();
         self.round += 1;
+        self.rerolls_this_shop = 0;
+        self.emit(GameEvent::ShopEnd);
         Ok(())
     }
 
     // Returns true if should clear blind after, false if not.
-    fn handle_score(&mut self, score: usize) -> Result<bool, GameError> {
+    pub(crate) fn handle_score(&mut self, score: usize) -> Result<bool, GameError> {
         // can only handle score if stage is blind
         if !self.stage.is_blind() {
             return Err(GameError::InvalidStage);
@@ -1870,10 +2303,12 @@ impl Game {
 
         // blind not passed
         if self.score < required {
-            // no more hands to play -> lose
+            // no more hands to play -> lose unless Mr. Bones saves us
             if self.plays == 0 {
-                self.stage = Stage::End(End::Lose);
-                return Ok(false);
+                if !self.try_mr_bones() {
+                    self.stage = Stage::End(End::Lose);
+                    return Ok(false);
+                }
             } else {
                 // more hands to play, carry on
                 return Ok(false);
@@ -1890,6 +2325,8 @@ impl Game {
 
         // passed boss blind, either win or progress ante
         if blind == Blind::Boss {
+            self.bosses_defeated += 1;
+            self.emit(GameEvent::BossDefeated);
             if let Some(ante_next) = self.ante_current.next(self.ante_end) {
                 self.ante_current = ante_next;
                 self.blind = None;
@@ -2103,12 +2540,95 @@ impl fmt::Display for Game {
 }
 
 fn initialize_new_joker(joker: &mut Jokers) {
-    // Seltzer starts with 10 hands of retrigger.
-    if matches!(joker, Jokers::Seltzer(_)) && joker.state().counter == 0.0 {
-        let mut state = joker.state();
-        state.counter = 10.0;
-        joker.set_state(state);
+    let mut state = joker.state();
+    match joker {
+        // Seltzer starts with 10 hands of retrigger.
+        Jokers::Seltzer(_) if state.counter == 0.0 => state.counter = 10.0,
+        Jokers::LoyaltyCard(_) => {
+            state.counter = 5.0;
+            state.aux = 5.0;
+        }
+        Jokers::Runner(_) => state.aux = 15.0,
+        Jokers::IceCream(_) => {
+            state.counter = 100.0;
+            state.aux = 5.0;
+        }
+        Jokers::SquareJoker(_) => state.aux = 4.0,
+        Jokers::Popcorn(_) => {
+            state.counter = 20.0;
+            state.aux = 4.0;
+        }
+        Jokers::FlashCard(_) => state.aux = 2.0,
+        Jokers::RedCard(_) => state.aux = 3.0,
+        Jokers::FortuneTeller(_) => state.aux = 1.0,
+        Jokers::Constellation(_) => {
+            state.counter = 1.0;
+            state.aux = 0.1;
+        }
+        Jokers::Hologram(_) => {
+            state.counter = 1.0;
+            state.aux = 0.25;
+        }
+        Jokers::Vampire(_) => {
+            state.counter = 1.0;
+            state.aux = 0.1;
+        }
+        Jokers::GlassJoker(_) => {
+            state.counter = 1.0;
+            state.aux = 0.75;
+        }
+        Jokers::Canio(_) => {
+            state.counter = 1.0;
+            state.aux = 1.0;
+        }
+        Jokers::LuckyCat(_) => {
+            state.counter = 1.0;
+            state.aux = 0.25;
+        }
+        Jokers::Ramen(_) => {
+            state.counter = 2.0;
+            state.aux = 0.01;
+        }
+        Jokers::Campfire(_) => {
+            state.counter = 1.0;
+            state.aux = 0.25;
+        }
+        Jokers::TurtleBean(_) => {
+            state.counter = 5.0;
+            state.aux = 1.0;
+        }
+        Jokers::AncientJoker(_) => state.aux = 1.5,
+        Jokers::TheIdol(_) => state.aux = 2.0,
+        Jokers::ToDoList(_) => state.counter = 4.0,
+        Jokers::Egg(_) => state.aux = 3.0,
+        Jokers::GiftCard(_) => state.aux = 1.0,
+        Jokers::Cloud9(_) => state.aux = 1.0,
+        Jokers::Rocket(_) => {
+            state.counter = 1.0;
+            state.aux = 2.0;
+        }
+        Jokers::ToTheMoon(_) => state.aux = 1.0,
+        Jokers::GoldenJoker(_) => state.aux = 4.0,
+        Jokers::DelayedGratification(_) => state.aux = 2.0,
+        Jokers::Satellite(_) => state.aux = 1.0,
+        Jokers::GrosMichel(_) => state.aux = 15.0,
+        Jokers::Cavendish(_) => state.aux = 3.0,
+        Jokers::InvisibleJoker(_) => state.aux = 2.0,
+        Jokers::MarbleJoker(_) => state.aux = 1.0,
+        Jokers::Burglar(_) => state.aux = 3.0,
+        Jokers::RiffRaff(_) => state.aux = 2.0,
+        Jokers::EightBall(_) => state.aux = 4.0,
+        Jokers::SpaceJoker(_) => state.aux = 4.0,
+        Jokers::Vagabond(_) => state.aux = 4.0,
+        Jokers::BurntJoker(_) => state.aux = 4.0,
+        Jokers::Hiker(_) => state.aux = 5.0,
+        Jokers::Madness(_) => {
+            state.counter = 1.0;
+            state.aux = 0.5;
+        }
+        _ => {}
     }
+    joker.set_state(state);
 }
 
 impl Default for Game {

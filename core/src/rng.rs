@@ -8,6 +8,7 @@ use crate::shop::{
     gen_random_playing_card, gen_shop_playing_card, ConsumableGenerator, JokerGenerator,
     PackGenerator, ShopContext,
 };
+use crate::spectral::{random_spectral, Spectral};
 use crate::tag::Tag;
 use crate::tarot::Tarot;
 use crate::voucher::{Voucher, Vouchers};
@@ -82,6 +83,8 @@ pub(crate) trait RngBackend {
     /// A single random Planet consumable, respecting `exclude` — used by
     /// the blue-seal round-end trigger and the High Priestess tarot effect.
     fn roll_random_planet(&mut self, planetarium: &Planetarium, exclude: &[Planets]) -> Consumable;
+    fn roll_random_spectral(&mut self) -> Spectral;
+    fn roll_int(&mut self, min: u32, max: u32) -> u32;
     /// Castle/MailInRebate's per-round reroll (`Game::clear_blind`). Mint-time
     /// rolling for freshly generated jokers already happens inside
     /// `gen_joker`/`gen_shop_item`/`gen_pack`, each already using the right
@@ -180,7 +183,9 @@ impl RngBackend for FastBackend {
     fn on_joker_bought(&mut self, _joker: &Jokers) {}
     fn on_joker_sold(&mut self, _joker: &Jokers) {}
     fn on_voucher_bought(&mut self, _voucher: &Voucher) {}
-    fn set_showman(&mut self, _owned: bool) {}
+    fn set_showman(&mut self, owned: bool) {
+        self.joker_gen.showman = owned;
+    }
 
     fn gen_joker(&mut self, _ante: i32, prob_mult: u32, exclude: &[Jokers]) -> Jokers {
         self.joker_gen.gen_joker(prob_mult, exclude, &mut self.rng)
@@ -237,6 +242,14 @@ impl RngBackend for FastBackend {
     fn roll_random_planet(&mut self, planetarium: &Planetarium, exclude: &[Planets]) -> Consumable {
         self.consumable_gen
             .gen_planet_consumable(planetarium, exclude, &mut self.rng)
+    }
+
+    fn roll_random_spectral(&mut self) -> Spectral {
+        random_spectral(&mut self.rng)
+    }
+
+    fn roll_int(&mut self, min: u32, max: u32) -> u32 {
+        self.rng.gen_range(min..=max)
     }
 
     fn roll_discard_selector(&mut self, j: &mut Jokers) {
@@ -438,6 +451,7 @@ impl RngBackend for RealBackend {
 
     fn set_showman(&mut self, owned: bool) {
         self.instance.params.showman = owned;
+        self.fast.set_showman(owned);
     }
 
     // `Instance::next_joker(source, ante)` exists and isn't wired up yet,
@@ -502,6 +516,14 @@ impl RngBackend for RealBackend {
     // wired up yet - real accuracy here is a follow-up.
     fn roll_random_planet(&mut self, planetarium: &Planetarium, exclude: &[Planets]) -> Consumable {
         self.fast.roll_random_planet(planetarium, exclude)
+    }
+
+    fn roll_random_spectral(&mut self) -> Spectral {
+        self.fast.roll_random_spectral()
+    }
+
+    fn roll_int(&mut self, min: u32, max: u32) -> u32 {
+        self.fast.roll_int(min, max)
     }
 
     fn roll_discard_selector(&mut self, j: &mut Jokers) {
@@ -680,6 +702,20 @@ impl RngBackend for Backend {
         match self {
             Backend::Fast(b) => b.roll_random_planet(planetarium, exclude),
             Backend::Real(b) => b.roll_random_planet(planetarium, exclude),
+        }
+    }
+
+    fn roll_random_spectral(&mut self) -> Spectral {
+        match self {
+            Backend::Fast(b) => b.roll_random_spectral(),
+            Backend::Real(b) => b.roll_random_spectral(),
+        }
+    }
+
+    fn roll_int(&mut self, min: u32, max: u32) -> u32 {
+        match self {
+            Backend::Fast(b) => b.roll_int(min, max),
+            Backend::Real(b) => b.roll_int(min, max),
         }
     }
 

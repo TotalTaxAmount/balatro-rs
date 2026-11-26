@@ -52,6 +52,10 @@ pub struct Stickers {
 pub enum SelectorValue {
     Suit(Suit),
     Value(Value),
+    /// Both a rank and a suit (The Idol).
+    RankSuit(Value, Suit),
+    /// A poker-hand type (To Do List).
+    HandRank(crate::rank::HandRank),
 }
 
 /// Per-instance persistent state slot, uniform across all jokers and mostly
@@ -62,7 +66,13 @@ pub enum SelectorValue {
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct JokerState {
     pub counter: f32,
+    /// Secondary per-instance value (gain/loss step, hand-size mod, etc.).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub aux: f32,
     pub selector: Option<SelectorValue>,
+    /// Permanent sell-value bonus (Egg / Gift Card).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub sell_bonus: usize,
 }
 
 /// `Jokers` is the definitive static repr of all jokers in the game.
@@ -360,7 +370,7 @@ macro_rules! joker_data {
                 match self { $(Self::$variant(_) => $desc,)* }
             }
             pub fn sell_value(&self) -> usize {
-                std::cmp::max(1, self.cost() / 2)
+                std::cmp::max(1, self.cost() / 2) + self.state().sell_bonus
             }
         }
     };

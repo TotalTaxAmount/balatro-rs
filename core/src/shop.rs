@@ -429,11 +429,13 @@ pub(crate) fn gen_random_playing_card(
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone)]
-pub(crate) struct JokerGenerator {}
+pub(crate) struct JokerGenerator {
+    pub(crate) showman: bool,
+}
 
 impl JokerGenerator {
     pub(crate) fn new() -> Self {
-        JokerGenerator {}
+        JokerGenerator { showman: false }
     }
 
     // Randomly generate rarity of new joker.
@@ -467,9 +469,10 @@ impl JokerGenerator {
         let choices: Vec<_> = all
             .iter()
             .filter(|j| {
-                !exclude
-                    .iter()
-                    .any(|e| std::mem::discriminant(e) == std::mem::discriminant(*j))
+                self.showman
+                    || !exclude
+                        .iter()
+                        .any(|e| std::mem::discriminant(e) == std::mem::discriminant(*j))
             })
             .cloned()
             .collect();
@@ -623,7 +626,7 @@ impl PackGenerator {
         held_jokers: &[Jokers],
         rng: &mut impl Rng,
     ) -> Vec<PackContent> {
-        let joker_gen = JokerGenerator {};
+        let joker_gen = JokerGenerator::new();
         let consumable_gen = ConsumableGenerator {};
 
         match category {
@@ -786,8 +789,7 @@ mod tests {
         let gen = PackGenerator {};
         for _ in 0..50 {
             let pack = gen.gen_pack(&planetarium, 1, None, &[], &mut rand::thread_rng());
-            let expected_count =
-                balatro_seed::pack_card_count(pack.category, pack.size) as usize;
+            let expected_count = balatro_seed::pack_card_count(pack.category, pack.size) as usize;
             assert_eq!(pack.contents.len(), expected_count);
         }
     }
@@ -803,8 +805,7 @@ mod tests {
                 continue;
             }
             saw_spectral = true;
-            let expected_count =
-                balatro_seed::pack_card_count(pack.category, pack.size) as usize;
+            let expected_count = balatro_seed::pack_card_count(pack.category, pack.size) as usize;
             assert_eq!(pack.contents.len(), expected_count);
             for content in &pack.contents {
                 let PackContent::Spectral(s) = content else {
@@ -813,7 +814,10 @@ mod tests {
                 assert!(!s.is_rare(), "{s:?} should never appear in a normal draw");
             }
         }
-        assert!(saw_spectral, "expected at least one Spectral pack in 200 draws");
+        assert!(
+            saw_spectral,
+            "expected at least one Spectral pack in 200 draws"
+        );
     }
 
     #[test]

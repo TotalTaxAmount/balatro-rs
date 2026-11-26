@@ -1,8 +1,12 @@
-use crate::card::{Card, Edition, Enhancement, Suit, Value};
-use crate::effect::{Effects, RuleFlag};
+use crate::card::{Card, Edition, Enhancement, Seal, Suit, Value};
+use crate::consumable::Consumable;
+use crate::effect::{Effects, GameEvent, RuleFlag};
 use crate::game::Game;
 use crate::hand::{MadeHand, SelectHand};
 use crate::rank::HandRank;
+use crate::rng::RngBackend;
+use crate::stage::Blind;
+use crate::tag::Tag;
 use rand::Rng;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -47,6 +51,22 @@ pub(crate) fn roll_discard_selector<R: Rng + ?Sized>(rng: &mut R, j: &mut Jokers
         Jokers::MailInRebate(_) => {
             let value = VALUES[rng.gen_range(0..VALUES.len())];
             j.state_mut().selector = Some(SelectorValue::Value(value));
+        }
+        Jokers::AncientJoker(_) => {
+            let suit = SUITS[rng.gen_range(0..SUITS.len())];
+            j.state_mut().selector = Some(SelectorValue::Suit(suit));
+        }
+        Jokers::TheIdol(_) => {
+            let value = VALUES[rng.gen_range(0..VALUES.len())];
+            let suit = SUITS[rng.gen_range(0..SUITS.len())];
+            j.state_mut().selector = Some(SelectorValue::RankSuit(value, suit));
+        }
+        Jokers::ToDoList(_) => {
+            let ranks: Vec<HandRank> = HandRank::iter()
+                .filter(|rank| *rank != HandRank::RoyalFlush)
+                .collect();
+            let rank = ranks[rng.gen_range(0..ranks.len())];
+            j.state_mut().selector = Some(SelectorValue::HandRank(rank));
         }
         _ => {}
     }
@@ -476,7 +496,7 @@ impl JokerEffects for Jokers {
             }
             Self::Bull(_) => {
                 fn apply(g: &mut Game, _hand: MadeHand) {
-                    g.chips += g.money * 2;
+                    g.chips += g.available_money().max(0) as usize * 2;
                 }
                 vec![Effects::OnScore(Arc::new(Mutex::new(apply)))]
             }
@@ -837,6 +857,1170 @@ impl JokerEffects for Jokers {
                 // decrement it more than once.
                 vec![Effects::TriggerCountPlayed(Arc::new(Mutex::new(trigger)))]
             }
+            // --- Wave 2 Phase 2: passive / immediate scoring ---
+            Self::Juggler(_) | Self::Drunkard(_) | Self::Troubadour(_) | Self::MerryAndy(_) => {
+                // Purely config modifiers, applied by Game::{hand_size,
+                // plays_per_round, discards_per_round}.
+                vec![]
+            }
+            Self::Stuntman(_) => {
+                fn apply(g: &mut Game, _hand: MadeHand) {
+                    g.chips += 250;
+                }
+                vec![Effects::OnScore(Arc::new(Mutex::new(apply)))]
+            }
+            Self::TurtleBean(_) => {
+                fn apply(g: &mut Game, _event: GameEvent) {
+                    for joker in g.jokers.clone() {
+                        if matches!(joker, Jokers::TurtleBean(_)) {
+                            if let Some(state) = g.joker_state_mut(joker.instance_id()) {
+                                state.counter = (state.counter - 1.0).max(0.0);
+                            }
+                        }
+                    }
+                }
+                vec![Effects::OnEvent(Arc::new(Mutex::new(apply)))]
+            }
+            Self::OopsAllSixes(_) => vec![Effects::RuleFlag(RuleFlag::DoubleProb)],
+            Self::Blackboard(_) => {
+                fn apply(g: &mut Game, _hand: MadeHand) {
+                    let all_black = g.available.not_selected().iter().all(|card| {
+                        g.matches_suit(card, Suit::Spade) || g.matches_suit(card, Suit::Club)
+                    });
+                    if all_black {
+                        g.multiply_mult(3.0);
+                    }
+                }
+                vec![Effects::OnScore(Arc::new(Mutex::new(apply)))]
+            }
+            Self::FlowerPot(_) => {
+                fn apply(g: &mut Game, hand: MadeHand) {
+                    let scored = hand.scored_cards(g.has_splash());
+                    let has = |suit: Suit| scored.iter().any(|card| g.matches_suit(card, suit));
+                    if has(Suit::Diamond) && has(Suit::Club) && has(Suit::Heart) && has(Suit::Spade)
+                    {
+                        g.multiply_mult(3.0);
+                    }
+                }
+                vec![Effects::OnScore(Arc::new(Mutex::new(apply)))]
+            }
+            Self::SeeingDouble(_) => {
+                fn apply(g: &mut Game, hand: MadeHand) {
+                    let scored = hand.scored_cards(g.has_splash());
+                    let has_club = scored.iter().any(|card| g.matches_suit(card, Suit::Club));
+                    let has_other = scored.iter().any(|card| !g.matches_suit(card, Suit::Club));
+                    if has_club && has_other {
+                        g.multiply_mult(2.0);
+                    }
+                }
+                vec![Effects::OnScore(Arc::new(Mutex::new(apply)))]
+            }
+            Self::Triboulet(_) => {
+                fn apply(g: &mut Game, hand: MadeHand) {
+                    let royals = hand
+                        .scored_cards(g.has_splash())
+                        .iter()
+                        .filter(|card| matches!(card.value, Value::King | Value::Queen))
+                        .count();
+                    for _ in 0..royals {
+                        g.multiply_mult(2.0);
+                    }
+                }
+                vec![Effects::OnScore(Arc::new(Mutex::new(apply)))]
+            }
+            Self::Bootstraps(_) => {
+                fn apply(g: &mut Game, _hand: MadeHand) {
+                    g.mult += (g.available_money().max(0) as usize / 5) * 2;
+                }
+                vec![Effects::OnScore(Arc::new(Mutex::new(apply)))]
+            }
+            Self::Swashbuckler(swash) => {
+                let id = swash.instance_id;
+                let apply = move |g: &mut Game, _hand: MadeHand| {
+                    let total: usize = g
+                        .jokers
+                        .iter()
+                        .filter(|joker| joker.instance_id() != id)
+                        .map(|joker| joker.sell_value())
+                        .sum();
+                    g.mult += total;
+                };
+                vec![Effects::OnScore(Arc::new(Mutex::new(apply)))]
+            }
+            Self::Misprint(_) => {
+                fn apply(g: &mut Game, _hand: MadeHand) {
+                    let value = g.random_range(0.0, 23.0);
+                    g.add_mult_frac(value);
+                }
+                vec![Effects::OnScore(Arc::new(Mutex::new(apply)))]
+            }
+            Self::Throwback(_) => {
+                fn apply(g: &mut Game, _hand: MadeHand) {
+                    g.multiply_mult(1.0 + 0.25 * g.skips as f64);
+                }
+                vec![Effects::OnScore(Arc::new(Mutex::new(apply)))]
+            }
+
+            // --- Wave 2 Phase 3: scaling and selector jokers ---
+            Self::LoyaltyCard(loyalty) => {
+                let id = loyalty.instance_id;
+                let apply = move |g: &mut Game, _hand: MadeHand| {
+                    let (remaining, every) = match g.jokers.iter().find(|j| j.instance_id() == id) {
+                        Some(joker) => (joker.state().counter, joker.state().aux.max(1.0)),
+                        None => return,
+                    };
+                    if remaining <= 1.0 {
+                        g.multiply_mult(4.0);
+                        if let Some(state) = g.joker_state_mut(id) {
+                            state.counter = every;
+                        }
+                    } else if let Some(state) = g.joker_state_mut(id) {
+                        state.counter = remaining - 1.0;
+                    }
+                };
+                vec![Effects::OnScore(Arc::new(Mutex::new(apply)))]
+            }
+            Self::Runner(runner) => {
+                let id = runner.instance_id;
+                let apply = move |g: &mut Game, hand: MadeHand| {
+                    let Some(mut state) = g
+                        .jokers
+                        .iter()
+                        .find(|j| j.instance_id() == id)
+                        .map(|j| j.state())
+                    else {
+                        return;
+                    };
+                    if hand_contains_straight(hand.rank) {
+                        state.counter += state.aux.max(0.0);
+                        if let Some(slot) = g.joker_state_mut(id) {
+                            slot.counter = state.counter;
+                        }
+                    }
+                    g.chips += state.counter.max(0.0) as usize;
+                };
+                vec![Effects::OnScore(Arc::new(Mutex::new(apply)))]
+            }
+            Self::IceCream(ice) => {
+                let id = ice.instance_id;
+                let apply = move |g: &mut Game, _hand: MadeHand| {
+                    let Some(state) = g
+                        .jokers
+                        .iter()
+                        .find(|j| j.instance_id() == id)
+                        .map(|j| j.state())
+                    else {
+                        return;
+                    };
+                    g.chips += state.counter.max(0.0) as usize;
+                    if let Some(slot) = g.joker_state_mut(id) {
+                        slot.counter = (state.counter - state.aux.max(0.0)).max(0.0);
+                    }
+                };
+                vec![Effects::OnScore(Arc::new(Mutex::new(apply)))]
+            }
+            Self::SquareJoker(square) => {
+                let id = square.instance_id;
+                let apply = move |g: &mut Game, hand: MadeHand| {
+                    let Some(mut state) = g
+                        .jokers
+                        .iter()
+                        .find(|j| j.instance_id() == id)
+                        .map(|j| j.state())
+                    else {
+                        return;
+                    };
+                    if hand.all.len() == 4 {
+                        state.counter += state.aux.max(0.0);
+                        if let Some(slot) = g.joker_state_mut(id) {
+                            slot.counter = state.counter;
+                        }
+                    }
+                    g.chips += state.counter.max(0.0) as usize;
+                };
+                vec![Effects::OnScore(Arc::new(Mutex::new(apply)))]
+            }
+            Self::Popcorn(popcorn) => {
+                let id = popcorn.instance_id;
+                let score = move |g: &mut Game, _hand: MadeHand| {
+                    let Some(state) = g
+                        .jokers
+                        .iter()
+                        .find(|j| j.instance_id() == id)
+                        .map(|j| j.state())
+                    else {
+                        return;
+                    };
+                    g.add_mult_frac(state.counter.max(0.0) as f64);
+                };
+                let decay = move |g: &mut Game, event: GameEvent| {
+                    if !matches!(event, GameEvent::RoundEnd) {
+                        return;
+                    }
+                    if let Some(state) = g.joker_state_mut(id) {
+                        state.counter = (state.counter - state.aux.max(0.0)).max(0.0);
+                    }
+                };
+                vec![
+                    Effects::OnScore(Arc::new(Mutex::new(score))),
+                    Effects::OnEvent(Arc::new(Mutex::new(decay))),
+                ]
+            }
+            Self::FlashCard(flash) => {
+                let id = flash.instance_id;
+                let score = move |g: &mut Game, _hand: MadeHand| {
+                    let Some(state) = g
+                        .jokers
+                        .iter()
+                        .find(|j| j.instance_id() == id)
+                        .map(|j| j.state())
+                    else {
+                        return;
+                    };
+                    g.add_mult_frac(state.counter.max(0.0) as f64);
+                };
+                let gain = move |g: &mut Game, event: GameEvent| {
+                    if matches!(event, GameEvent::Reroll) {
+                        if let Some(state) = g.joker_state_mut(id) {
+                            state.counter += state.aux.max(0.0);
+                        }
+                    }
+                };
+                vec![
+                    Effects::OnScore(Arc::new(Mutex::new(score))),
+                    Effects::OnEvent(Arc::new(Mutex::new(gain))),
+                ]
+            }
+            Self::RedCard(red) => {
+                let id = red.instance_id;
+                let score = move |g: &mut Game, _hand: MadeHand| {
+                    let Some(state) = g
+                        .jokers
+                        .iter()
+                        .find(|j| j.instance_id() == id)
+                        .map(|j| j.state())
+                    else {
+                        return;
+                    };
+                    g.add_mult_frac(state.counter.max(0.0) as f64);
+                };
+                let gain = move |g: &mut Game, event: GameEvent| {
+                    if matches!(event, GameEvent::PackSkipped) {
+                        if let Some(state) = g.joker_state_mut(id) {
+                            state.counter += state.aux.max(0.0);
+                        }
+                    }
+                };
+                vec![
+                    Effects::OnScore(Arc::new(Mutex::new(score))),
+                    Effects::OnEvent(Arc::new(Mutex::new(gain))),
+                ]
+            }
+            Self::FortuneTeller(fortune) => {
+                let id = fortune.instance_id;
+                let score = move |g: &mut Game, _hand: MadeHand| {
+                    let Some(state) = g
+                        .jokers
+                        .iter()
+                        .find(|j| j.instance_id() == id)
+                        .map(|j| j.state())
+                    else {
+                        return;
+                    };
+                    g.add_mult_frac(state.counter.max(0.0) as f64);
+                };
+                let gain = move |g: &mut Game, event: GameEvent| {
+                    if matches!(event, GameEvent::ConsumableUsed(Consumable::Tarot(_))) {
+                        if let Some(state) = g.joker_state_mut(id) {
+                            state.counter += state.aux.max(0.0);
+                        }
+                    }
+                };
+                vec![
+                    Effects::OnScore(Arc::new(Mutex::new(score))),
+                    Effects::OnEvent(Arc::new(Mutex::new(gain))),
+                ]
+            }
+            Self::Constellation(constellation) => {
+                let id = constellation.instance_id;
+                let score = move |g: &mut Game, _hand: MadeHand| {
+                    if let Some(state) = g
+                        .jokers
+                        .iter()
+                        .find(|j| j.instance_id() == id)
+                        .map(|j| j.state())
+                    {
+                        g.multiply_mult(state.counter.max(0.0) as f64);
+                    }
+                };
+                let gain = move |g: &mut Game, event: GameEvent| {
+                    if matches!(event, GameEvent::ConsumableUsed(Consumable::Planet(_))) {
+                        if let Some(state) = g.joker_state_mut(id) {
+                            state.counter += state.aux.max(0.0);
+                        }
+                    }
+                };
+                vec![
+                    Effects::OnScore(Arc::new(Mutex::new(score))),
+                    Effects::OnEvent(Arc::new(Mutex::new(gain))),
+                ]
+            }
+            Self::Hologram(hologram) => {
+                let id = hologram.instance_id;
+                let score = move |g: &mut Game, _hand: MadeHand| {
+                    if let Some(state) = g
+                        .jokers
+                        .iter()
+                        .find(|j| j.instance_id() == id)
+                        .map(|j| j.state())
+                    {
+                        g.multiply_mult(state.counter.max(0.0) as f64);
+                    }
+                };
+                let gain = move |g: &mut Game, event: GameEvent| {
+                    if matches!(event, GameEvent::CardAdded(_)) {
+                        if let Some(state) = g.joker_state_mut(id) {
+                            state.counter += state.aux.max(0.0);
+                        }
+                    }
+                };
+                vec![
+                    Effects::OnScore(Arc::new(Mutex::new(score))),
+                    Effects::OnEvent(Arc::new(Mutex::new(gain))),
+                ]
+            }
+            Self::Vampire(vampire) => {
+                let id = vampire.instance_id;
+                let modify = move |g: &mut Game, hand: &mut MadeHand| {
+                    // The client strips enhancements before the scored card
+                    // pass, so the Bonus/etc. does not score this hand.
+                    let scored_ids: HashSet<usize> = hand
+                        .scored_cards(g.has_splash())
+                        .iter()
+                        .map(|card| card.id)
+                        .collect();
+                    let enhanced = hand
+                        .all
+                        .iter()
+                        .filter(|card| scored_ids.contains(&card.id) && card.enhancement.is_some())
+                        .count();
+                    if enhanced > 0 {
+                        if let Some(state) = g.joker_state_mut(id) {
+                            state.counter += state.aux.max(0.0) * enhanced as f32;
+                        }
+                    }
+                    for card in hand.all.iter_mut() {
+                        if scored_ids.contains(&card.id) && card.enhancement.is_some() {
+                            card.enhancement = None;
+                            g.mutate_card(card.id, |c| c.enhancement = None);
+                        }
+                    }
+                    let made_ids: HashSet<usize> =
+                        hand.hand.cards().iter().map(|card| card.id).collect();
+                    let made: Vec<Card> = hand
+                        .all
+                        .iter()
+                        .filter(|card| made_ids.contains(&card.id))
+                        .cloned()
+                        .collect();
+                    hand.hand = SelectHand::new(made);
+                };
+                let score = move |g: &mut Game, _hand: MadeHand| {
+                    if let Some(state) = g
+                        .jokers
+                        .iter()
+                        .find(|j| j.instance_id() == id)
+                        .map(|j| j.state())
+                    {
+                        g.multiply_mult(state.counter.max(0.0) as f64);
+                    }
+                };
+                vec![
+                    Effects::OnModifyHand(Arc::new(Mutex::new(modify))),
+                    Effects::OnScore(Arc::new(Mutex::new(score))),
+                ]
+            }
+            Self::GlassJoker(glass) => {
+                let id = glass.instance_id;
+                let score = move |g: &mut Game, _hand: MadeHand| {
+                    if let Some(state) = g
+                        .jokers
+                        .iter()
+                        .find(|j| j.instance_id() == id)
+                        .map(|j| j.state())
+                    {
+                        g.multiply_mult(state.counter.max(0.0) as f64);
+                    }
+                };
+                let gain = move |g: &mut Game, event: GameEvent| {
+                    if let GameEvent::CardDestroyed(card) = event {
+                        if card.enhancement == Some(Enhancement::Glass) {
+                            if let Some(state) = g.joker_state_mut(id) {
+                                state.counter += state.aux.max(0.0);
+                            }
+                        }
+                    }
+                };
+                vec![
+                    Effects::OnScore(Arc::new(Mutex::new(score))),
+                    Effects::OnEvent(Arc::new(Mutex::new(gain))),
+                ]
+            }
+            Self::Canio(canio) => {
+                let id = canio.instance_id;
+                let score = move |g: &mut Game, _hand: MadeHand| {
+                    if let Some(state) = g
+                        .jokers
+                        .iter()
+                        .find(|j| j.instance_id() == id)
+                        .map(|j| j.state())
+                    {
+                        g.multiply_mult(state.counter.max(0.0) as f64);
+                    }
+                };
+                let gain = move |g: &mut Game, event: GameEvent| {
+                    if let GameEvent::CardDestroyed(card) = event {
+                        if g.is_face_card(&card) {
+                            if let Some(state) = g.joker_state_mut(id) {
+                                state.counter += state.aux.max(0.0);
+                            }
+                        }
+                    }
+                };
+                vec![
+                    Effects::OnScore(Arc::new(Mutex::new(score))),
+                    Effects::OnEvent(Arc::new(Mutex::new(gain))),
+                ]
+            }
+            Self::LuckyCat(cat) => {
+                let id = cat.instance_id;
+                let score = move |g: &mut Game, _hand: MadeHand| {
+                    if let Some(state) = g
+                        .jokers
+                        .iter()
+                        .find(|j| j.instance_id() == id)
+                        .map(|j| j.state())
+                    {
+                        g.multiply_mult(state.counter.max(0.0) as f64);
+                    }
+                };
+                let gain = move |g: &mut Game, event: GameEvent| {
+                    if matches!(event, GameEvent::LuckyTriggered) {
+                        if let Some(state) = g.joker_state_mut(id) {
+                            state.counter += state.aux.max(0.0);
+                        }
+                    }
+                };
+                vec![
+                    Effects::OnScore(Arc::new(Mutex::new(score))),
+                    Effects::OnEvent(Arc::new(Mutex::new(gain))),
+                ]
+            }
+            Self::Ramen(ramen) => {
+                let id = ramen.instance_id;
+                let score = move |g: &mut Game, _hand: MadeHand| {
+                    if let Some(state) = g
+                        .jokers
+                        .iter()
+                        .find(|j| j.instance_id() == id)
+                        .map(|j| j.state())
+                    {
+                        g.multiply_mult(state.counter.max(0.0) as f64);
+                    }
+                };
+                let lose = move |g: &mut Game, event: GameEvent| {
+                    if let GameEvent::Discard { discarded, .. } = event {
+                        if let Some(state) = g.joker_state_mut(id) {
+                            let loss = state.aux.max(0.0) * discarded.len() as f32;
+                            state.counter = (state.counter - loss).max(0.0);
+                        }
+                    }
+                };
+                vec![
+                    Effects::OnScore(Arc::new(Mutex::new(score))),
+                    Effects::OnEvent(Arc::new(Mutex::new(lose))),
+                ]
+            }
+            Self::Campfire(campfire) => {
+                let id = campfire.instance_id;
+                let score = move |g: &mut Game, _hand: MadeHand| {
+                    if let Some(state) = g
+                        .jokers
+                        .iter()
+                        .find(|j| j.instance_id() == id)
+                        .map(|j| j.state())
+                    {
+                        g.multiply_mult(state.counter.max(0.0) as f64);
+                    }
+                };
+                let change = move |g: &mut Game, event: GameEvent| match event {
+                    GameEvent::JokerSold(_) => {
+                        if let Some(state) = g.joker_state_mut(id) {
+                            state.counter += state.aux.max(0.0);
+                        }
+                    }
+                    GameEvent::BossDefeated => {
+                        if let Some(state) = g.joker_state_mut(id) {
+                            state.counter = 1.0;
+                        }
+                    }
+                    _ => {}
+                };
+                vec![
+                    Effects::OnScore(Arc::new(Mutex::new(score))),
+                    Effects::OnEvent(Arc::new(Mutex::new(change))),
+                ]
+            }
+            Self::AncientJoker(ancient) => {
+                let id = ancient.instance_id;
+                let apply = move |g: &mut Game, hand: MadeHand| {
+                    let Some(SelectorValue::Suit(suit)) = g
+                        .jokers
+                        .iter()
+                        .find(|j| j.instance_id() == id)
+                        .and_then(|j| j.state().selector)
+                    else {
+                        return;
+                    };
+                    let factor = g
+                        .jokers
+                        .iter()
+                        .find(|j| j.instance_id() == id)
+                        .map(|j| j.state().aux.max(1.0))
+                        .unwrap_or(1.5) as f64;
+                    let count = hand
+                        .scored_cards(g.has_splash())
+                        .iter()
+                        .filter(|card| g.matches_suit(card, suit))
+                        .count();
+                    for _ in 0..count {
+                        g.multiply_mult(factor);
+                    }
+                };
+                vec![Effects::OnScore(Arc::new(Mutex::new(apply)))]
+            }
+            Self::TheIdol(idol) => {
+                let id = idol.instance_id;
+                let apply = move |g: &mut Game, hand: MadeHand| {
+                    let Some(SelectorValue::RankSuit(value, suit)) = g
+                        .jokers
+                        .iter()
+                        .find(|j| j.instance_id() == id)
+                        .and_then(|j| j.state().selector)
+                    else {
+                        return;
+                    };
+                    let factor = g
+                        .jokers
+                        .iter()
+                        .find(|j| j.instance_id() == id)
+                        .map(|j| j.state().aux.max(1.0))
+                        .unwrap_or(2.0) as f64;
+                    let count = hand
+                        .scored_cards(g.has_splash())
+                        .iter()
+                        .filter(|card| {
+                            card.value == value
+                                && card.enhancement != Some(Enhancement::Stone)
+                                && g.matches_suit(card, suit)
+                        })
+                        .count();
+                    for _ in 0..count {
+                        g.multiply_mult(factor);
+                    }
+                };
+                vec![Effects::OnScore(Arc::new(Mutex::new(apply)))]
+            }
+            Self::ToDoList(todo) => {
+                let id = todo.instance_id;
+                let apply = move |g: &mut Game, hand: MadeHand| {
+                    let Some(SelectorValue::HandRank(rank)) = g
+                        .jokers
+                        .iter()
+                        .find(|j| j.instance_id() == id)
+                        .and_then(|j| j.state().selector)
+                    else {
+                        return;
+                    };
+                    if hand.rank == rank {
+                        let dollars = g
+                            .jokers
+                            .iter()
+                            .find(|j| j.instance_id() == id)
+                            .map(|j| j.state().counter.max(0.0) as usize)
+                            .unwrap_or(4);
+                        g.money += dollars;
+                    }
+                };
+                vec![Effects::OnScore(Arc::new(Mutex::new(apply)))]
+            }
+
+            // --- Wave 2 Phase 4: round-end economy and destruction ---
+            Self::Egg(egg) => {
+                let id = egg.instance_id;
+                let grow = move |g: &mut Game, event: GameEvent| {
+                    if matches!(event, GameEvent::RoundEnd) {
+                        if let Some(state) = g.joker_state_mut(id) {
+                            state.sell_bonus += state.aux.max(0.0) as usize;
+                        }
+                    }
+                };
+                vec![Effects::OnEvent(Arc::new(Mutex::new(grow)))]
+            }
+            Self::GiftCard(gift) => {
+                let id = gift.instance_id;
+                let grow = move |g: &mut Game, event: GameEvent| {
+                    if matches!(event, GameEvent::RoundEnd) {
+                        let amount = g
+                            .jokers
+                            .iter()
+                            .find(|j| j.instance_id() == id)
+                            .map(|j| j.state().aux.max(0.0) as usize)
+                            .unwrap_or(1);
+                        for joker in g.jokers.iter_mut() {
+                            joker.state_mut().sell_bonus += amount;
+                        }
+                        g.consumable_sell_bonus += amount;
+                    }
+                };
+                vec![Effects::OnEvent(Arc::new(Mutex::new(grow)))]
+            }
+            Self::Cloud9(cloud) => {
+                let id = cloud.instance_id;
+                let apply = move |g: &mut Game, event: GameEvent| {
+                    if matches!(event, GameEvent::RoundEnd) {
+                        let per = g
+                            .jokers
+                            .iter()
+                            .find(|j| j.instance_id() == id)
+                            .map(|j| j.state().aux.max(0.0) as usize)
+                            .unwrap_or(1);
+                        let nines = g
+                            .full_deck()
+                            .iter()
+                            .filter(|card| card.value == Value::Nine)
+                            .count();
+                        g.money += nines * per;
+                    }
+                };
+                vec![Effects::OnEvent(Arc::new(Mutex::new(apply)))]
+            }
+            Self::Rocket(rocket) => {
+                let id = rocket.instance_id;
+                let change = move |g: &mut Game, event: GameEvent| match event {
+                    GameEvent::RoundEnd => {
+                        let payout = g
+                            .jokers
+                            .iter()
+                            .find(|j| j.instance_id() == id)
+                            .map(|j| j.state().counter.max(0.0) as usize)
+                            .unwrap_or(1);
+                        g.money += payout;
+                    }
+                    GameEvent::BossDefeated => {
+                        if let Some(state) = g.joker_state_mut(id) {
+                            state.counter += state.aux.max(0.0);
+                        }
+                    }
+                    _ => {}
+                };
+                vec![Effects::OnEvent(Arc::new(Mutex::new(change)))]
+            }
+            Self::ToTheMoon(moon) => {
+                let id = moon.instance_id;
+                let apply = move |g: &mut Game, event: GameEvent| {
+                    if matches!(event, GameEvent::RoundEnd) {
+                        let per = g
+                            .jokers
+                            .iter()
+                            .find(|j| j.instance_id() == id)
+                            .map(|j| j.state().aux.max(0.0) as usize)
+                            .unwrap_or(1);
+                        g.money += (g.available_money().max(0) as usize / 5) * per;
+                    }
+                };
+                vec![Effects::OnEvent(Arc::new(Mutex::new(apply)))]
+            }
+            Self::GoldenJoker(golden) => {
+                let id = golden.instance_id;
+                let apply = move |g: &mut Game, event: GameEvent| {
+                    if matches!(event, GameEvent::RoundEnd) {
+                        let payout = g
+                            .jokers
+                            .iter()
+                            .find(|j| j.instance_id() == id)
+                            .map(|j| j.state().aux.max(0.0) as usize)
+                            .unwrap_or(4);
+                        g.money += payout;
+                    }
+                };
+                vec![Effects::OnEvent(Arc::new(Mutex::new(apply)))]
+            }
+            Self::DelayedGratification(delayed) => {
+                let id = delayed.instance_id;
+                let apply = move |g: &mut Game, event: GameEvent| {
+                    if matches!(event, GameEvent::RoundEnd) {
+                        let per = g
+                            .jokers
+                            .iter()
+                            .find(|j| j.instance_id() == id)
+                            .map(|j| j.state().aux.max(0.0) as usize)
+                            .unwrap_or(2);
+                        g.money += g.discards_remaining * per;
+                    }
+                };
+                vec![Effects::OnEvent(Arc::new(Mutex::new(apply)))]
+            }
+            Self::Satellite(satellite) => {
+                let id = satellite.instance_id;
+                let apply = move |g: &mut Game, event: GameEvent| {
+                    if matches!(event, GameEvent::RoundEnd) {
+                        let per = g
+                            .jokers
+                            .iter()
+                            .find(|j| j.instance_id() == id)
+                            .map(|j| j.state().aux.max(0.0) as usize)
+                            .unwrap_or(1);
+                        g.money += g.planets_used.len() * per;
+                    }
+                };
+                vec![Effects::OnEvent(Arc::new(Mutex::new(apply)))]
+            }
+            Self::GrosMichel(gros) => {
+                let id = gros.instance_id;
+                let score = move |g: &mut Game, _hand: MadeHand| {
+                    let mult = g
+                        .jokers
+                        .iter()
+                        .find(|j| j.instance_id() == id)
+                        .map(|j| j.state().aux.max(0.0) as usize)
+                        .unwrap_or(15);
+                    g.mult += mult;
+                };
+                let decay = move |g: &mut Game, event: GameEvent| {
+                    if matches!(event, GameEvent::RoundEnd) && g.prob_roll(1, 6) {
+                        if let Some(idx) = g.jokers.iter().position(|j| j.instance_id() == id) {
+                            g.destroy_joker_at(idx);
+                        }
+                    }
+                };
+                vec![
+                    Effects::OnScore(Arc::new(Mutex::new(score))),
+                    Effects::OnEvent(Arc::new(Mutex::new(decay))),
+                ]
+            }
+            Self::Cavendish(cavendish) => {
+                let id = cavendish.instance_id;
+                let score = move |g: &mut Game, _hand: MadeHand| {
+                    let factor = g
+                        .jokers
+                        .iter()
+                        .find(|j| j.instance_id() == id)
+                        .map(|j| j.state().aux.max(1.0) as f64)
+                        .unwrap_or(3.0);
+                    g.multiply_mult(factor);
+                };
+                let decay = move |g: &mut Game, event: GameEvent| {
+                    if matches!(event, GameEvent::RoundEnd) && g.prob_roll(1, 1000) {
+                        if let Some(idx) = g.jokers.iter().position(|j| j.instance_id() == id) {
+                            g.destroy_joker_at(idx);
+                        }
+                    }
+                };
+                vec![
+                    Effects::OnScore(Arc::new(Mutex::new(score))),
+                    Effects::OnEvent(Arc::new(Mutex::new(decay))),
+                ]
+            }
+            Self::MrBones(_) => vec![],
+            Self::InvisibleJoker(invisible) => {
+                let id = invisible.instance_id;
+                let ready_at_sale = invisible.state.counter >= invisible.state.aux.max(1.0);
+                let tick = move |g: &mut Game, event: GameEvent| {
+                    if matches!(event, GameEvent::RoundEnd) {
+                        if let Some(state) = g.joker_state_mut(id) {
+                            state.counter += 1.0;
+                        }
+                    }
+                };
+                let duplicate = move |g: &mut Game| {
+                    if !ready_at_sale || g.jokers.len() >= g.joker_slots() {
+                        return;
+                    }
+                    let candidates: Vec<Jokers> = g
+                        .jokers
+                        .iter()
+                        .filter(|j| j.instance_id() != id)
+                        .cloned()
+                        .collect();
+                    if candidates.is_empty() {
+                        return;
+                    }
+                    let mut source = g.backend.pick_random_joker(candidates);
+                    source.set_edition(Edition::Base);
+                    let source = g.backend.clone_joker(source);
+                    g.add_owned_joker(source);
+                };
+                vec![
+                    Effects::OnEvent(Arc::new(Mutex::new(tick))),
+                    Effects::OnSell(Arc::new(Mutex::new(duplicate))),
+                ]
+            }
+
+            // --- Wave 2 Phase 5: blind selection, deck, and card creation ---
+            Self::CeremonialDagger(ceremonial) => {
+                let id = ceremonial.instance_id;
+                let apply = move |g: &mut Game, event: GameEvent| {
+                    if !matches!(event, GameEvent::BlindSelected(_)) {
+                        return;
+                    }
+                    let Some(index) = g.jokers.iter().position(|j| j.instance_id() == id) else {
+                        return;
+                    };
+                    if index + 1 >= g.jokers.len() {
+                        return;
+                    }
+                    let bonus = g.jokers[index + 1].sell_value() * 2;
+                    g.destroy_joker_at(index + 1);
+                    if let Some(state) = g.joker_state_mut(id) {
+                        state.counter += bonus as f32;
+                    }
+                };
+                vec![Effects::OnEvent(Arc::new(Mutex::new(apply)))]
+            }
+            Self::MarbleJoker(marble) => {
+                let id = marble.instance_id;
+                let apply = move |g: &mut Game, event: GameEvent| {
+                    if !matches!(event, GameEvent::BlindSelected(_)) {
+                        return;
+                    }
+                    let count = g
+                        .jokers
+                        .iter()
+                        .find(|j| j.instance_id() == id)
+                        .map(|j| j.state().aux.max(1.0) as usize)
+                        .unwrap_or(1);
+                    for _ in 0..count {
+                        let mut card = g.backend.gen_random_card(g.prob_mult, false, None);
+                        card.enhancement = Some(Enhancement::Stone);
+                        g.add_card_to_deck(card);
+                    }
+                };
+                vec![Effects::OnEvent(Arc::new(Mutex::new(apply)))]
+            }
+            Self::Burglar(burglar) => {
+                let id = burglar.instance_id;
+                let apply = move |g: &mut Game, event: GameEvent| {
+                    if !matches!(event, GameEvent::BlindSelected(_)) {
+                        return;
+                    }
+                    let extra = g
+                        .jokers
+                        .iter()
+                        .find(|j| j.instance_id() == id)
+                        .map(|j| j.state().aux.max(0.0) as usize)
+                        .unwrap_or(3);
+                    g.plays += extra;
+                    g.discards_remaining = 0;
+                };
+                vec![Effects::OnEvent(Arc::new(Mutex::new(apply)))]
+            }
+            Self::RiffRaff(riff) => {
+                let id = riff.instance_id;
+                let apply = move |g: &mut Game, event: GameEvent| {
+                    if !matches!(event, GameEvent::BlindSelected(_)) {
+                        return;
+                    }
+                    let count = g
+                        .jokers
+                        .iter()
+                        .find(|j| j.instance_id() == id)
+                        .map(|j| j.state().aux.max(0.0) as usize)
+                        .unwrap_or(2);
+                    for _ in 0..count {
+                        let ante = g.ante_current as i32;
+                        let prob_mult = g.prob_mult;
+                        let exclude = g.jokers.clone();
+                        let joker = g.backend.gen_joker_of_rarity(
+                            ante,
+                            prob_mult,
+                            &exclude,
+                            Rarity::Common,
+                        );
+                        if !g.add_owned_joker(joker) {
+                            break;
+                        }
+                    }
+                };
+                vec![Effects::OnEvent(Arc::new(Mutex::new(apply)))]
+            }
+            Self::Cartomancer(_) => {
+                fn apply(g: &mut Game, event: GameEvent) {
+                    if matches!(event, GameEvent::BlindSelected(_)) {
+                        g.add_random_tarot();
+                    }
+                }
+                vec![Effects::OnEvent(Arc::new(Mutex::new(apply)))]
+            }
+            Self::Certificate(_) => {
+                fn apply(g: &mut Game, event: GameEvent) {
+                    if !matches!(event, GameEvent::BlindSelected(_)) {
+                        return;
+                    }
+                    let mut card = g.backend.gen_random_card(g.prob_mult, false, None);
+                    card.seal = Some(match g.backend.roll_int(0, 3) {
+                        0 => Seal::Red,
+                        1 => Seal::Blue,
+                        2 => Seal::Gold,
+                        _ => Seal::Purple,
+                    });
+                    g.available.extend(vec![card]);
+                }
+                vec![Effects::OnEvent(Arc::new(Mutex::new(apply)))]
+            }
+            Self::Dna(_) => {
+                fn apply(g: &mut Game, event: GameEvent) {
+                    let GameEvent::HandPlayed { played, first, .. } = event else {
+                        return;
+                    };
+                    if !first || played.len() != 1 {
+                        return;
+                    }
+                    let original = played[0];
+                    let mut copy = Card::new(original.value, original.suit);
+                    copy.enhancement = original.enhancement;
+                    copy.edition = original.edition;
+                    copy.seal = original.seal;
+                    copy.bonus_chips = original.bonus_chips;
+                    g.available.extend(vec![copy]);
+                    g.draw_adjust -= 1;
+                }
+                vec![Effects::OnEvent(Arc::new(Mutex::new(apply)))]
+            }
+            Self::SixthSense(_) => {
+                fn apply(g: &mut Game, event: GameEvent) {
+                    let GameEvent::HandPlayed { played, first, .. } = event else {
+                        return;
+                    };
+                    if !first || played.len() != 1 || played[0].value != Value::Six {
+                        return;
+                    }
+                    g.destroy_card(played[0].id);
+                    g.draw_adjust += 1;
+                    g.add_random_spectral();
+                }
+                vec![Effects::OnEvent(Arc::new(Mutex::new(apply)))]
+            }
+            Self::EightBall(ball) => {
+                let id = ball.instance_id;
+                let apply = move |g: &mut Game, hand: MadeHand| {
+                    let eights = hand
+                        .scored_cards(g.has_splash())
+                        .iter()
+                        .filter(|card| card.value == Value::Eight)
+                        .count();
+                    let odds = g
+                        .jokers
+                        .iter()
+                        .find(|j| j.instance_id() == id)
+                        .map(|j| j.state().aux.max(1.0) as u32)
+                        .unwrap_or(4);
+                    for _ in 0..eights {
+                        if g.prob_roll(1, odds) {
+                            g.add_random_tarot();
+                        }
+                    }
+                };
+                vec![Effects::OnScore(Arc::new(Mutex::new(apply)))]
+            }
+            Self::SpaceJoker(space) => {
+                let id = space.instance_id;
+                let apply = move |g: &mut Game, event: GameEvent| {
+                    let GameEvent::BeforeScore(rank) = event else {
+                        return;
+                    };
+                    let odds = g
+                        .jokers
+                        .iter()
+                        .find(|j| j.instance_id() == id)
+                        .map(|j| j.state().aux.max(1.0) as u32)
+                        .unwrap_or(4);
+                    if g.prob_roll(1, odds) {
+                        g.planetarium.level_up(rank.scoring_rank());
+                    }
+                };
+                vec![Effects::OnEvent(Arc::new(Mutex::new(apply)))]
+            }
+            Self::Superposition(_) => {
+                fn apply(g: &mut Game, event: GameEvent) {
+                    let GameEvent::HandPlayed { rank, played, .. } = event else {
+                        return;
+                    };
+                    let has_ace = played.iter().any(|card| card.value == Value::Ace);
+                    if has_ace && hand_contains_straight(rank) {
+                        g.add_random_tarot();
+                    }
+                }
+                vec![Effects::OnEvent(Arc::new(Mutex::new(apply)))]
+            }
+            Self::Seance(_) => {
+                fn apply(g: &mut Game, event: GameEvent) {
+                    let GameEvent::HandPlayed { rank, .. } = event else {
+                        return;
+                    };
+                    if matches!(rank, HandRank::StraightFlush | HandRank::RoyalFlush) {
+                        g.add_random_spectral();
+                    }
+                }
+                vec![Effects::OnEvent(Arc::new(Mutex::new(apply)))]
+            }
+            Self::Vagabond(vagabond) => {
+                let id = vagabond.instance_id;
+                let apply = move |g: &mut Game, event: GameEvent| {
+                    if !matches!(event, GameEvent::HandPlayed { .. }) {
+                        return;
+                    }
+                    let threshold = g
+                        .jokers
+                        .iter()
+                        .find(|j| j.instance_id() == id)
+                        .map(|j| j.state().aux.max(0.0) as usize)
+                        .unwrap_or(4);
+                    if g.money <= threshold {
+                        g.add_random_tarot();
+                    }
+                };
+                vec![Effects::OnEvent(Arc::new(Mutex::new(apply)))]
+            }
+            Self::BurntJoker(_) => {
+                fn apply(g: &mut Game, event: GameEvent) {
+                    let GameEvent::Discard { rank, first, .. } = event else {
+                        return;
+                    };
+                    if first {
+                        g.planetarium.level_up(rank.scoring_rank());
+                    }
+                }
+                vec![Effects::OnEvent(Arc::new(Mutex::new(apply)))]
+            }
+            Self::Hiker(hiker) => {
+                let id = hiker.instance_id;
+                let apply = move |g: &mut Game, event: GameEvent| {
+                    let GameEvent::HandPlayed { scored, .. } = event else {
+                        return;
+                    };
+                    let bonus = g
+                        .jokers
+                        .iter()
+                        .find(|j| j.instance_id() == id)
+                        .map(|j| j.state().aux.max(0.0) as i32)
+                        .unwrap_or(5);
+                    for card in scored {
+                        g.mutate_card(card.id, |c| c.bonus_chips += bonus);
+                    }
+                };
+                vec![Effects::OnEvent(Arc::new(Mutex::new(apply)))]
+            }
+            Self::Madness(madness) => {
+                let id = madness.instance_id;
+                let score = move |g: &mut Game, _hand: MadeHand| {
+                    if let Some(state) = g
+                        .jokers
+                        .iter()
+                        .find(|j| j.instance_id() == id)
+                        .map(|j| j.state())
+                    {
+                        g.multiply_mult(state.counter.max(0.0) as f64);
+                    }
+                };
+                let apply = move |g: &mut Game, event: GameEvent| {
+                    let GameEvent::BlindSelected(blind) = event else {
+                        return;
+                    };
+                    if !matches!(blind, Blind::Small | Blind::Big) {
+                        return;
+                    }
+                    let gain = g
+                        .jokers
+                        .iter()
+                        .find(|j| j.instance_id() == id)
+                        .map(|j| j.state().aux.max(0.0))
+                        .unwrap_or(0.5);
+                    if let Some(state) = g.joker_state_mut(id) {
+                        state.counter += gain;
+                    }
+                    let candidates: Vec<Jokers> = g
+                        .jokers
+                        .iter()
+                        .filter(|j| j.instance_id() != id)
+                        .cloned()
+                        .collect();
+                    if candidates.is_empty() {
+                        return;
+                    }
+                    let target = g.backend.pick_random_joker(candidates);
+                    if let Some(index) = g
+                        .jokers
+                        .iter()
+                        .position(|j| j.instance_id() == target.instance_id())
+                    {
+                        g.destroy_joker_at(index);
+                    }
+                };
+                vec![
+                    Effects::OnScore(Arc::new(Mutex::new(score))),
+                    Effects::OnEvent(Arc::new(Mutex::new(apply))),
+                ]
+            }
+
+            // --- Wave 2 Phase 6: shop / macro jokers ---
+            Self::CreditCard(_)
+            | Self::ChaosTheClown(_)
+            | Self::Astronomer(_)
+            | Self::Showman(_) => {
+                // Handled by Game::credit_limit / free_rerolls / pricing /
+                // the shop generator's Showman flag.
+                vec![]
+            }
+            Self::Hallucination(hallucination) => {
+                let id = hallucination.instance_id;
+                let apply = move |g: &mut Game, event: GameEvent| {
+                    if !matches!(event, GameEvent::PackOpened) {
+                        return;
+                    }
+                    let odds = g
+                        .jokers
+                        .iter()
+                        .find(|j| j.instance_id() == id)
+                        .map(|j| j.state().aux.max(1.0) as u32)
+                        .unwrap_or(2);
+                    if g.prob_roll(1, odds) {
+                        g.add_random_tarot();
+                    }
+                };
+                vec![Effects::OnEvent(Arc::new(Mutex::new(apply)))]
+            }
+            Self::DietCola(_) => {
+                fn apply(g: &mut Game) {
+                    g.tags.push(Tag::Double);
+                }
+                vec![Effects::OnSell(Arc::new(Mutex::new(apply)))]
+            }
+            Self::Perkeo(_) => {
+                fn apply(g: &mut Game, event: GameEvent) {
+                    if !matches!(event, GameEvent::ShopEnd) {
+                        return;
+                    }
+                    let mut pool = g.consumables.clone();
+                    pool.extend(g.negative_consumables.iter().copied());
+                    if pool.is_empty() {
+                        return;
+                    }
+                    let idx = g.backend.roll_int(0, pool.len() as u32 - 1) as usize;
+                    g.negative_consumables.push(pool[idx]);
+                }
+                vec![Effects::OnEvent(Arc::new(Mutex::new(apply)))]
+            }
             _ => vec![],
         }
     }
@@ -925,6 +2109,75 @@ impl JokerEffects for Jokers {
                 | Self::Blueprint(_)
                 | Self::Brainstorm(_)
                 | Self::Seltzer(_)
+                | Self::Juggler(_)
+                | Self::Drunkard(_)
+                | Self::Troubadour(_)
+                | Self::MerryAndy(_)
+                | Self::Stuntman(_)
+                | Self::TurtleBean(_)
+                | Self::OopsAllSixes(_)
+                | Self::Blackboard(_)
+                | Self::FlowerPot(_)
+                | Self::SeeingDouble(_)
+                | Self::Triboulet(_)
+                | Self::Bootstraps(_)
+                | Self::Swashbuckler(_)
+                | Self::Misprint(_)
+                | Self::Throwback(_)
+                | Self::LoyaltyCard(_)
+                | Self::Runner(_)
+                | Self::IceCream(_)
+                | Self::SquareJoker(_)
+                | Self::Popcorn(_)
+                | Self::FlashCard(_)
+                | Self::RedCard(_)
+                | Self::FortuneTeller(_)
+                | Self::Constellation(_)
+                | Self::Hologram(_)
+                | Self::Vampire(_)
+                | Self::GlassJoker(_)
+                | Self::Canio(_)
+                | Self::LuckyCat(_)
+                | Self::Ramen(_)
+                | Self::Campfire(_)
+                | Self::AncientJoker(_)
+                | Self::TheIdol(_)
+                | Self::ToDoList(_)
+                | Self::Egg(_)
+                | Self::GiftCard(_)
+                | Self::Cloud9(_)
+                | Self::Rocket(_)
+                | Self::ToTheMoon(_)
+                | Self::GoldenJoker(_)
+                | Self::DelayedGratification(_)
+                | Self::Satellite(_)
+                | Self::GrosMichel(_)
+                | Self::Cavendish(_)
+                | Self::MrBones(_)
+                | Self::InvisibleJoker(_)
+                | Self::CeremonialDagger(_)
+                | Self::MarbleJoker(_)
+                | Self::Burglar(_)
+                | Self::RiffRaff(_)
+                | Self::Cartomancer(_)
+                | Self::Certificate(_)
+                | Self::Dna(_)
+                | Self::SixthSense(_)
+                | Self::EightBall(_)
+                | Self::SpaceJoker(_)
+                | Self::Superposition(_)
+                | Self::Seance(_)
+                | Self::Vagabond(_)
+                | Self::BurntJoker(_)
+                | Self::Hiker(_)
+                | Self::Madness(_)
+                | Self::CreditCard(_)
+                | Self::ChaosTheClown(_)
+                | Self::Astronomer(_)
+                | Self::Showman(_)
+                | Self::Hallucination(_)
+                | Self::DietCola(_)
+                | Self::Perkeo(_)
         )
     }
 }
@@ -1074,9 +2327,9 @@ mod tests {
     // `effects()` behavior implemented. Shop/pack generation
     // must never offer joker that silently does nothing.
     #[test]
-    fn test_exactly_81_jokers_implemented() {
+    fn test_exactly_150_jokers_implemented() {
         let count = Jokers::iter().filter(|j| j.is_implemented()).count();
-        assert_eq!(count, 81);
+        assert_eq!(count, 150);
     }
 
     #[test]
@@ -4254,7 +5507,10 @@ mod tests {
             "j_turtle_bean",
         ] {
             let joker = Jokers::from_id(id).unwrap_or_else(|| panic!("missing {id}"));
-            assert!(is_copy_incompatible(&joker), "{id} must be copy-incompatible");
+            assert!(
+                is_copy_incompatible(&joker),
+                "{id} must be copy-incompatible"
+            );
         }
     }
 
