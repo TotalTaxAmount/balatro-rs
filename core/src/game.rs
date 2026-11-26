@@ -824,7 +824,7 @@ impl Game {
         self.emitting = false;
     }
 
-    pub(crate) fn register_jokers(&mut self) {
+    pub fn register_jokers(&mut self) {
         let jokers = self.jokers.clone();
         self.effect_registry.register_jokers(jokers, &self.clone());
         self.backend.set_showman(self.has_showman());
