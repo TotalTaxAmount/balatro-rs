@@ -2,13 +2,14 @@
 
 use std::collections::HashSet;
 
-use crate::card::{Card, Enhancement, Suit, Value};
+use crate::available::Available;
+use crate::card::{Card, Enhancement, Seal, Suit, Value};
 use crate::effect::GameEvent;
 use crate::game::{Game, ProbMode};
 use crate::hand::SelectHand;
 use crate::joker::*;
 use crate::rank::HandRank;
-use crate::stage::Blind;
+use crate::stage::{Blind, Stage};
 
 fn add(g: &mut Game, mut joker: Jokers) {
     joker.set_instance_id(g.jokers.len() + 1);
@@ -1105,4 +1106,59 @@ fn two_runner_jokers_both_gain() {
     assert_eq!(score(&mut g, straight), 444);
     assert_eq!(g.joker_state_mut(1).unwrap().counter, 15.0);
     assert_eq!(g.joker_state_mut(2).unwrap().counter, 15.0);
+}
+
+#[test]
+fn held_gold_money_counts_mime_and_blueprint_copies() {
+    let mut gold = Card::new(Value::King, Suit::Heart);
+    gold.enhancement = Some(Enhancement::Gold);
+
+    let mut g = Game::default();
+    g.available = Available::from_cards(vec![(gold, false)]);
+    g.jokers = vec![
+        Jokers::Blueprint(Blueprint::default()),
+        Jokers::Mime(Mime::default()),
+    ];
+    for (index, joker) in g.jokers.iter_mut().enumerate() {
+        joker.set_instance_id(index + 1);
+    }
+    g.register_jokers();
+
+    // Base held trigger + Mime + Blueprint copying Mime.
+    assert_eq!(g.held_gold_money(&[]), 9);
+}
+
+#[test]
+fn last_hand_rank_tracks_the_most_recent_play() {
+    let mut g = Game::default();
+    g.stage = Stage::Blind(Blind::Small);
+    let king1 = Card::new(Value::King, Suit::Heart);
+    let king2 = Card::new(Value::King, Suit::Diamond);
+    let hand = SelectHand::new(vec![king1, king2]).best_hand().unwrap();
+    g.calc_score(hand);
+    assert_eq!(g.last_hand_rank(), Some(HandRank::OnePair));
+}
+
+#[test]
+fn baron_is_retriggered_by_mime_and_red_seal() {
+    let played = card(Value::Two, Suit::Club);
+    let mut king = card(Value::King, Suit::Heart);
+
+    let mut g = Game::default();
+    g.stage = Stage::Blind(Blind::Small);
+    g.available = Available::from_cards(vec![(king, false)]);
+    add(&mut g, Jokers::Mime(Mime::default()));
+    add(&mut g, Jokers::Baron(Baron::default()));
+    register(&mut g);
+    // High card 2: 7 chips. Mime retriggers Baron for 1.5^2.
+    assert_eq!(score(&mut g, vec![played]), 15);
+
+    king.seal = Some(Seal::Red);
+    let mut g = Game::default();
+    g.stage = Stage::Blind(Blind::Small);
+    g.available = Available::from_cards(vec![(king, false)]);
+    add(&mut g, Jokers::Baron(Baron::default()));
+    register(&mut g);
+    // A red seal also retriggers Baron: 1.5^2.
+    assert_eq!(score(&mut g, vec![played]), 15);
 }

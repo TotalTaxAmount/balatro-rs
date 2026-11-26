@@ -159,6 +159,9 @@ pub struct Game {
     // shared game-level history some jokers key off (RideTheBus, Obelisk, etc)
     #[cfg_attr(feature = "serde", serde(default))]
     pub(crate) hand_ranks_played_this_round: HashSet<HandRank>,
+    /// Most recent hand rank scored this round, for repeat-aware planning.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub(crate) last_hand_rank: Option<HandRank>,
     #[cfg_attr(feature = "serde", serde(default))]
     pub(crate) consecutive_hands_without_face_card: usize,
     #[cfg_attr(feature = "serde", serde(default))]
@@ -333,6 +336,7 @@ impl Game {
             range_script_pos: 0,
             required_score_override: None,
             hand_ranks_played_this_round: HashSet::new(),
+            last_hand_rank: None,
             consecutive_hands_without_face_card: 0,
             consecutive_hands_not_most_played_type: 0,
             discarded_this_round: Vec::new(),
@@ -563,6 +567,7 @@ impl Game {
         self.plays = self.plays_per_round();
         self.discards_remaining = self.discards_per_round();
         self.hand_ranks_played_this_round.clear();
+        self.last_hand_rank = None;
         self.discarded_this_round.clear();
         self.hands_played_this_round = 0;
         self.boss_disabled_by_luchador = false;
@@ -897,6 +902,31 @@ impl Game {
     }
 
     /// Whether the active boss (if any) currently debuffs card
+    /// Most recent hand rank scored this round.
+    pub fn last_hand_rank(&self) -> Option<HandRank> {
+        self.last_hand_rank
+    }
+
+    /// Money paid by Gold cards held at round end, including Mime and
+    /// Blueprint/Brainstorm copies of held-retrigger effects.
+    pub fn held_gold_money(&mut self, played: &[usize]) -> usize {
+        let selected: HashSet<usize> = played.iter().copied().collect();
+        let held: Vec<Card> = self
+            .available
+            .cards()
+            .into_iter()
+            .filter(|card| {
+                !selected.contains(&card.id)
+                    && card.enhancement == Some(Enhancement::Gold)
+                    && !self.is_card_debuffed(card)
+            })
+            .collect();
+
+        held.into_iter()
+            .map(|card| 3 * self.trigger_count_held(&card))
+            .sum()
+    }
+
     pub fn is_card_debuffed(&self, card: &Card) -> bool {
         match self.active_boss() {
             Some(BossBlind::Club) => self.matches_suit(card, Suit::Club),
@@ -1342,7 +1372,7 @@ impl Game {
     }
 
     // Extension point for retrigger (jokers + red seal)
-    fn trigger_count_held(&mut self, card: &Card) -> usize {
+    pub(crate) fn trigger_count_held(&mut self, card: &Card) -> usize {
         let mut n = if card.seal == Some(Seal::Red) { 2 } else { 1 };
         for e in self.effect_registry.trigger_count_held.clone() {
             if let Effects::TriggerCountHeld(f) = e {
@@ -1637,6 +1667,7 @@ impl Game {
 
         // record after joker loop, not before (for CardSharp)
         self.hand_ranks_played_this_round.insert(hand.rank);
+        self.last_hand_rank = Some(hand.rank);
 
         // compute score
         let score = (self.chips as f64 * self.mult_value()).floor() as usize;

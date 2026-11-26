@@ -391,13 +391,19 @@ impl JokerEffects for Jokers {
             }
             Self::Baron(_) => {
                 fn apply(g: &mut Game, _hand: MadeHand) {
-                    let kings = g
+                    // Mime and red seals retrigger each held King's Baron
+                    // contribution, so use the same held-trigger count as
+                    // Steel/Gold instead of counting each King once.
+                    let kings: Vec<Card> = g
                         .non_debuffed(g.available.not_selected().iter())
-                        .iter()
-                        .filter(|c| c.value == Value::King)
-                        .count();
-                    for _ in 0..kings {
-                        g.multiply_mult(1.5);
+                        .into_iter()
+                        .filter(|card| card.value == Value::King)
+                        .collect();
+                    for king in kings {
+                        let triggers = g.trigger_count_held(&king);
+                        for _ in 0..triggers {
+                            g.multiply_mult(1.5);
+                        }
                     }
                 }
                 vec![Effects::OnScore(Arc::new(Mutex::new(apply)))]
