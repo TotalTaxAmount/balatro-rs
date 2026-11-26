@@ -467,23 +467,15 @@ impl Game {
         self.available.extend(self.deck.draw(count));
     }
 
-    /// Draw cards, reshuffling the discard pile into the deck when the draw
-    /// pile runs out mid-round (real Balatro behavior). If both piles are
-    /// empty, the hand simply stays short.
-    fn draw_with_reshuffle(&mut self, count: usize) {
-        let mut remaining = count;
-        while remaining > 0 {
-            let drawn = self.deck.draw(remaining);
-            let drawn_count = drawn.len();
-            self.available.extend(drawn);
-            remaining -= drawn_count;
-
-            if remaining == 0 || self.discarded.is_empty() {
-                break;
-            }
-
-            self.deck.append(&mut self.discarded);
-            self.backend.shuffle_deck(&mut self.deck);
+    /// Vanilla Balatro does not reshuffle the discard pile mid-round. If the
+    /// hand is empty and the draw pile is empty while the blind is still
+    /// unmet, the run is over.
+    fn check_out_of_cards(&mut self) {
+        if self.stage.is_blind()
+            && self.available.cards().is_empty()
+            && self.score < self.required_score()
+        {
+            self.stage = Stage::End(End::Lose);
         }
     }
 
@@ -541,7 +533,8 @@ impl Game {
         } else {
             removed
         };
-        self.draw_with_reshuffle(n);
+        self.draw(n);
+        self.check_out_of_cards();
         for card in scored.hand.cards() {
             if card.enhancement == Some(Enhancement::Glass) && self.prob_roll(1, 4) {
                 self.destroy_card(card.id);
@@ -569,7 +562,8 @@ impl Game {
         } else {
             removed
         };
-        self.draw_with_reshuffle(n);
+        self.draw(n);
+        self.check_out_of_cards();
 
         // Check for purple seals
         for card in &discarded {
@@ -1744,6 +1738,7 @@ impl Game {
         self.plays = self.plays_per_round();
         self.discards_remaining = self.discards_per_round();
         self.deal();
+        self.check_out_of_cards();
         Ok(())
     }
 
@@ -3391,19 +3386,36 @@ mod tests {
     }
 
     #[test]
-    fn test_draw_with_reshuffle_recycles_discard() {
-        let mut g = Game::default();
-        g.deck = Deck::from_cards(vec![Card::new(Value::Two, Suit::Heart)]);
-        g.discarded = vec![
-            Card::new(Value::Three, Suit::Heart),
-            Card::new(Value::Four, Suit::Heart),
-        ];
+    fn test_empty_hand_and_deck_loses_blind() {
+        let mut g = Game {
+            stage: Stage::Blind(Blind::Small),
+            required_score_override: Some(300),
+            ..Default::default()
+        };
+        g.available = Available::default();
+        g.deck = Deck::new();
 
-        g.draw_with_reshuffle(2);
+        g.check_out_of_cards();
 
-        assert_eq!(g.available.cards().len(), 2);
-        assert!(g.discarded.is_empty());
-        assert_eq!(g.deck.cards().len(), 1);
+        assert_eq!(g.stage, Stage::End(End::Lose));
+    }
+
+    #[test]
+    fn test_playing_last_card_with_empty_deck_loses_blind() {
+        let mut g = Game {
+            stage: Stage::Blind(Blind::Small),
+            required_score_override: Some(9999),
+            ..Default::default()
+        };
+        g.deck = Deck::new();
+        g.plays = 4;
+
+        let card = Card::new(Value::Ace, Suit::Heart);
+        g.available = Available::from_cards(vec![(card, false)]);
+        g.select_card(card).expect("select the only card");
+        g.play_selected().expect("play the only card");
+
+        assert_eq!(g.stage, Stage::End(End::Lose));
     }
 
     #[test]
