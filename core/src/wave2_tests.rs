@@ -972,3 +972,23 @@ fn photograph_doubles_before_additive_jokers() {
     // Photograph X2 first (1 -> 2), Popcorn +8 (-> 10), Abstract +15 (-> 25).
     assert_eq!(score(&mut g, vec![jack]), 15 * 25);
 }
+
+#[test]
+fn smiley_before_photograph_is_better_than_reversed() {
+    let mut left = Game::default();
+    add(&mut left, Jokers::SmileyFace(SmileyFace::default()));
+    add(&mut left, Jokers::Photograph(Photograph::default()));
+    register(&mut left);
+
+    let mut right = Game::default();
+    add(&mut right, Jokers::Photograph(Photograph::default()));
+    add(&mut right, Jokers::SmileyFace(SmileyFace::default()));
+    register(&mut right);
+
+    let king = card(Value::King, Suit::Heart);
+    // High Card K: 15 chips.
+    // Smiley left: +5 then X2 => 12 mult => 180.
+    // Photo left: X2 then +5 => 7 mult => 105.
+    assert_eq!(score(&mut left, vec![king]), 180);
+    assert_eq!(score(&mut right, vec![king]), 105);
+}

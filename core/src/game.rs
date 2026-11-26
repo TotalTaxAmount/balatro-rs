@@ -221,6 +221,12 @@ pub struct Game {
     pub(crate) emitting: bool,
     #[cfg_attr(feature = "serde", serde(skip))]
     pub(crate) event_queue: Vec<GameEvent>,
+    /// First face card scored this hand (for Photograph).
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) first_face_id: Option<usize>,
+    /// Jokers whose once-per-hand card trigger already fired.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) card_scored_jokers: HashSet<usize>,
 
     pub last_consumable_used: Option<Consumable>,
     #[cfg_attr(feature = "serde", serde(default))]
@@ -355,6 +361,8 @@ impl Game {
             free_rerolls: 0,
             emitting: false,
             event_queue: Vec::new(),
+            first_face_id: None,
+            card_scored_jokers: HashSet::new(),
             last_consumable_used: None,
             last_score: 0,
             reroll_cost: default_reroll_cost(),
@@ -1354,6 +1362,8 @@ impl Game {
         mut trace: Option<&mut ScoreTrace>,
     ) -> usize {
         self.boss_triggered_this_hand = false;
+        self.first_face_id = None;
+        self.card_scored_jokers.clear();
 
         // Space Joker upgrades the hand before its base chips/mult are read.
         self.emit(GameEvent::BeforeScore(hand.rank));
@@ -1418,6 +1428,10 @@ impl Game {
         // Stone cards are excluded here and handled by the Stone kicker loop
         // below so their edition/seal is not applied twice.
         let scoring_cards: Vec<Card> = hand.scored_cards(self.has_splash());
+        self.first_face_id = scoring_cards
+            .iter()
+            .find(|card| !self.is_card_debuffed(card) && self.is_face_card(card))
+            .map(|card| card.id);
 
         // first card in original play order that's actually used in scoring:
         // either part of the made hand, or a stone kicker (which always scores).
@@ -1432,16 +1446,6 @@ impl Game {
                 .find(|c| hand_ids.contains(&c.id) || c.enhancement == Some(Enhancement::Stone))
                 .map(|c| c.id)
         };
-
-        // Photograph triggers on the first face card scored, during the
-        // card-scoring pass, so additive jokers later in the order still count
-        // once before its X2.
-        let photograph_count = self
-            .jokers
-            .iter()
-            .filter(|joker| matches!(joker, Jokers::Photograph(_)))
-            .count();
-        let mut photograph_triggered = false;
 
         // per-scored-card, rank chips, enhancements, editions
         for card in scoring_cards {
@@ -1488,6 +1492,14 @@ impl Game {
                     self.money += 3;
                 }
 
+                // Per-card joker effects trigger in joker order for each
+                // scoring event, after the card's own chips/enhancement.
+                for e in self.effect_registry.on_card_scored.clone() {
+                    if let Effects::OnCardScored(f) = e {
+                        f.lock().unwrap()(self, card);
+                    }
+                }
+
                 self.record_step(
                     &mut trace,
                     ScoreSource::PlayedCard(card),
@@ -1495,12 +1507,6 @@ impl Game {
                     mult_before,
                     trig > 0,
                 );
-            }
-            if !photograph_triggered && photograph_count > 0 && self.is_face_card(&card) {
-                for _ in 0..photograph_count {
-                    self.multiply_mult(2.0);
-                }
-                photograph_triggered = true;
             }
         }
 

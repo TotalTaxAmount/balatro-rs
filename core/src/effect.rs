@@ -12,6 +12,7 @@ type GameHandFn = Arc<Mutex<dyn Fn(&mut Game, MadeHand) + Send + 'static>>;
 type GameFn = Arc<Mutex<dyn Fn(&mut Game) + Send + 'static>>;
 type GameModifyFn = Arc<Mutex<dyn Fn(&mut Game, &mut MadeHand) + Send + 'static>>;
 type CardTriggerFn = Arc<Mutex<dyn Fn(&mut Game, Card, bool) -> usize + Send + 'static>>;
+type CardEffectFn = Arc<Mutex<dyn Fn(&mut Game, Card) + Send + 'static>>;
 type EventFn = Arc<Mutex<dyn Fn(&mut Game, GameEvent) + Send + 'static>>;
 
 /// Non-scoring lifecycle events. Jokers that gain/trigger outside the normal
@@ -68,6 +69,7 @@ pub struct EffectRegistry {
     pub on_round_end: Vec<Effects>,
     pub trigger_count_played: Vec<Effects>,
     pub trigger_count_held: Vec<Effects>,
+    pub on_card_scored: Vec<Effects>,
     pub on_event: Vec<Effects>,
     pub rule_flags: HashSet<RuleFlag>,
 }
@@ -82,6 +84,7 @@ impl EffectRegistry {
             on_round_end: Vec::new(),
             trigger_count_played: Vec::new(),
             trigger_count_held: Vec::new(),
+            on_card_scored: Vec::new(),
             on_event: Vec::new(),
             rule_flags: HashSet::new(),
         }
@@ -103,6 +106,7 @@ impl EffectRegistry {
         self.on_round_end.clear();
         self.trigger_count_played.clear();
         self.trigger_count_held.clear();
+        self.on_card_scored.clear();
         self.on_event.clear();
         self.rule_flags.clear();
         for j in jokers {
@@ -117,6 +121,7 @@ impl EffectRegistry {
                     Effects::OnRoundEnd(_) => self.on_round_end.push(e),
                     Effects::TriggerCountPlayed(_) => self.trigger_count_played.push(e),
                     Effects::TriggerCountHeld(_) => self.trigger_count_held.push(e),
+                    Effects::OnCardScored(_) => self.on_card_scored.push(e),
                     Effects::OnEvent(_) => self.on_event.push(e),
                     Effects::RuleFlag(flag) => {
                         self.rule_flags.insert(flag);
@@ -140,6 +145,7 @@ pub enum Effects {
     OnRoundEnd(GameFn),
     TriggerCountPlayed(CardTriggerFn),
     TriggerCountHeld(CardTriggerFn),
+    OnCardScored(CardEffectFn),
     OnEvent(EventFn),
     RuleFlag(RuleFlag),
 }
@@ -156,6 +162,7 @@ impl std::fmt::Debug for Effects {
             Self::OnRoundEnd(_) => write!(f, "OnRoundEnd"),
             Self::TriggerCountPlayed(_) => write!(f, "TriggerCountPlayed"),
             Self::TriggerCountHeld(_) => write!(f, "TriggerCountHeld"),
+            Self::OnCardScored(_) => write!(f, "OnCardScored"),
             Self::OnEvent(_) => write!(f, "OnEvent"),
             Self::RuleFlag(flag) => write!(f, "RuleFlag({:?})", flag),
         }
