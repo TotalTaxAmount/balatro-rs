@@ -715,6 +715,14 @@ impl Game {
         }
     }
 
+    /// Replace the RNG backend with a deterministic fast RNG. Used by the
+    /// simulator so each Monte Carlo world can vary probabilistic effects
+    /// while keeping the draw-pile order fixed.
+    pub fn reseed(&mut self, seed: u64) {
+        self.backend = Backend::Fast(FastBackend::new(ChaCha8Rng::seed_from_u64(seed)));
+        self.seed = seed;
+    }
+
     /// Evaluate a hypothetical play without mutating `self`.
     ///
     /// The played cards must be cards currently in `available`; the remaining
