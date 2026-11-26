@@ -51,12 +51,12 @@ fn main() {
             "{}  (chips {} mult {})",
             step.describe(),
             step.chips_after,
-            step.mult_after
+            step.mult_value_after()
         );
     }
     println!();
 
     let final_chips = trace.0.last().map(|s| s.chips_after).unwrap_or(0);
-    let final_mult = trace.0.last().map(|s| s.mult_after).unwrap_or(0);
+    let final_mult = trace.0.last().map(|s| s.mult_value_after()).unwrap_or(0.0);
     println!("{final_chips} x {final_mult} = {score}");
 }

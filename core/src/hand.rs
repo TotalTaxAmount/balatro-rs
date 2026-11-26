@@ -45,8 +45,14 @@ impl SelectHand {
         self.0.len()
     }
     // Get all values in a hand. Sorted lowest to highest.
+    // Stone cards have no rank and never participate in hand ranking.
     fn values(&self) -> Vec<Value> {
-        self.0.iter().map(|x| x.value).sorted().collect()
+        self.0
+            .iter()
+            .filter(|card| card.enhancement != Some(Enhancement::Stone))
+            .map(|x| x.value)
+            .sorted()
+            .collect()
     }
     pub(crate) fn cards(&self) -> Vec<Card> {
         self.0.clone()
@@ -57,6 +63,9 @@ impl SelectHand {
     fn values_freq(&self) -> IndexMap<Value, Vec<Card>> {
         let mut counts: IndexMap<Value, Vec<Card>> = IndexMap::new();
         for card in self.0.clone() {
+            if card.enhancement == Some(Enhancement::Stone) {
+                continue;
+            }
             if let Some(cards) = counts.get(&card.value) {
                 let mut copy = cards.clone();
                 copy.push(card);
@@ -78,6 +87,9 @@ impl SelectHand {
     pub(crate) fn suits_freq(&self) -> IndexMap<Suit, Vec<Card>> {
         let mut counts: IndexMap<Suit, Vec<Card>> = IndexMap::new();
         for card in self.0.clone() {
+            if card.enhancement == Some(Enhancement::Stone) {
+                continue;
+            }
             if let Some(cards) = counts.get(&card.suit) {
                 let mut copy = cards.clone();
                 copy.push(card);
@@ -99,7 +111,7 @@ impl SelectHand {
     fn cards_of_values(&self, values: &[Value]) -> Vec<Card> {
         self.0
             .iter()
-            .filter(|c| values.contains(&c.value))
+            .filter(|c| c.enhancement != Some(Enhancement::Stone) && values.contains(&c.value))
             .cloned()
             .collect()
     }
@@ -174,10 +186,15 @@ impl SelectHand {
         if self.len() < 1 {
             return None;
         }
-        let (value, _) = self
+        let Some((value, _)) = self
             .values_freq()
             .into_iter()
-            .find(|(_key, val)| !val.is_empty())?;
+            .find(|(_key, val)| !val.is_empty())
+        else {
+            // A hand made only of Stone cards is still High Card; the stone
+            // kicker scoring loop handles the +50 chips.
+            return Some(SelectHand::new(Vec::new()));
+        };
         Some(SelectHand::new(self.cards_of_values(&[value])))
     }
 
@@ -224,11 +241,12 @@ impl SelectHand {
     }
 
     pub(crate) fn is_straight(&self) -> Option<SelectHand> {
-        if self.len() != 5 {
+        // Stone cards have no rank and cannot fill a straight.
+        let values = self.values();
+        if values.len() != 5 {
             return None;
         }
         // Iterate our sorted values. Each value must be one more than the previous.
-        let values = self.values();
         if values.windows(2).all(|v| (v[1] as u16 - v[0] as u16) == 1) {
             return Some(self.clone());
         }
@@ -270,11 +288,9 @@ impl SelectHand {
         }
 
         let mut suit_groups: IndexMap<Suit, Vec<Card>> = IndexMap::new();
-        for card in self
-            .0
-            .iter()
-            .filter(|c| c.enhancement != Some(Enhancement::Wild))
-        {
+        for card in self.0.iter().filter(|c| {
+            c.enhancement != Some(Enhancement::Wild) && c.enhancement != Some(Enhancement::Stone)
+        }) {
             suit_groups.entry(card.suit).or_default().push(*card);
         }
 
@@ -1129,5 +1145,41 @@ mod tests {
         let hand = SelectHand::new(vec![c1, c2, c3, c4]);
         let ff = hand.is_flush_five();
         assert_eq!(ff, None);
+    }
+
+    #[test]
+    fn test_stone_cards_have_no_rank_or_suit() {
+        let ace = Card::new(Value::Ace, Suit::Heart);
+        let king = Card::new(Value::King, Suit::Heart);
+        let queen = Card::new(Value::Queen, Suit::Heart);
+        let jack = Card::new(Value::Jack, Suit::Heart);
+        let mut stone = Card::new(Value::Ten, Suit::Heart);
+        stone.enhancement = Some(Enhancement::Stone);
+
+        // 4 suited cards + a Stone do not make a flush.
+        let hand = SelectHand::new(vec![ace, king, queen, jack, stone]);
+        assert!(hand.is_flush().is_none());
+
+        // A K Q J + Stone is not a straight; best is High Card Ace.
+        let best = hand.best_hand().unwrap();
+        assert_eq!(best.rank, HandRank::HighCard);
+        assert_eq!(best.hand.cards(), vec![ace]);
+
+        // Two Kings + a Stone King is only a pair, not trips.
+        let k1 = Card::new(Value::King, Suit::Club);
+        let k2 = Card::new(Value::King, Suit::Diamond);
+        let mut stone_king = Card::new(Value::King, Suit::Spade);
+        stone_king.enhancement = Some(Enhancement::Stone);
+        let best = SelectHand::new(vec![k1, k2, stone_king])
+            .best_hand()
+            .unwrap();
+        assert_eq!(best.rank, HandRank::OnePair);
+        assert_eq!(best.hand.cards().len(), 2);
+
+        // A Stone-only hand is High Card with an empty scoring subset; the
+        // kicker scoring pass handles the +50 chips.
+        let best = SelectHand::new(vec![stone]).best_hand().unwrap();
+        assert_eq!(best.rank, HandRank::HighCard);
+        assert!(best.hand.cards().is_empty());
     }
 }

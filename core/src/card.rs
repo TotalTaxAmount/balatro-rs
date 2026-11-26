@@ -49,15 +49,20 @@ impl Card {
     }
 
     pub fn is_face_card(&self) -> bool {
-        matches!(self.value, Value::Jack | Value::Queen | Value::King)
+        self.enhancement != Some(Enhancement::Stone)
+            && matches!(self.value, Value::Jack | Value::Queen | Value::King)
     }
 
     pub(crate) fn is_even_impl(&self, is_face: bool) -> bool {
-        self.value != Value::Ace && !is_face && (self.value as u16).is_multiple_of(2)
+        self.enhancement != Some(Enhancement::Stone)
+            && self.value != Value::Ace
+            && !is_face
+            && (self.value as u16).is_multiple_of(2)
     }
 
     pub(crate) fn is_odd_impl(&self, is_face: bool) -> bool {
-        self.value == Value::Ace || (!is_face && !(self.value as u16).is_multiple_of(2))
+        self.enhancement != Some(Enhancement::Stone)
+            && (self.value == Value::Ace || (!is_face && !(self.value as u16).is_multiple_of(2)))
     }
 
     pub fn is_even(&self) -> bool {
@@ -69,10 +74,14 @@ impl Card {
     }
 
     pub fn matches_suit(&self, suit: Suit) -> bool {
-        self.enhancement == Some(Enhancement::Wild) || self.suit == suit
+        self.enhancement != Some(Enhancement::Stone)
+            && (self.enhancement == Some(Enhancement::Wild) || self.suit == suit)
     }
 
     pub fn chips(&self) -> usize {
+        if self.enhancement == Some(Enhancement::Stone) {
+            return 0;
+        }
         match self.value {
             Value::Two => 2,
             Value::Three => 3,

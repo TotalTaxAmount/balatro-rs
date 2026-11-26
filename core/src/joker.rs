@@ -208,7 +208,7 @@ impl JokerEffects for Jokers {
                 fn apply(g: &mut Game, _hand: MadeHand) {
                     let empty = g.joker_slots().saturating_sub(g.jokers.len());
                     if empty > 0 {
-                        g.mult *= empty;
+                        g.multiply_mult(empty as f64);
                     }
                 }
                 vec![Effects::OnScore(Arc::new(Mutex::new(apply)))]
@@ -251,7 +251,7 @@ impl JokerEffects for Jokers {
             Self::CardSharp(_) => {
                 fn apply(g: &mut Game, hand: MadeHand) {
                     if g.hand_ranks_played_this_round.contains(&hand.rank) {
-                        g.mult *= 3;
+                        g.multiply_mult(3.0);
                     }
                 }
                 vec![Effects::OnScore(Arc::new(Mutex::new(apply)))]
@@ -269,9 +269,9 @@ impl JokerEffects for Jokers {
                         g.consecutive_hands_not_most_played_type = 0;
                     } else {
                         g.consecutive_hands_not_most_played_type += 1;
-                        g.mult +=
-                            (g.mult as f64 * 0.2 * g.consecutive_hands_not_most_played_type as f64)
-                                as usize;
+                        g.add_mult_frac(
+                            g.mult_value() * 0.2 * g.consecutive_hands_not_most_played_type as f64,
+                        );
                     }
                 }
                 vec![Effects::OnScore(Arc::new(Mutex::new(apply)))]
@@ -402,7 +402,7 @@ impl JokerEffects for Jokers {
                         .filter(|c| c.value == Value::King)
                         .count();
                     for _ in 0..kings {
-                        g.mult = (g.mult as f64 * 1.5) as usize;
+                        g.multiply_mult(1.5);
                     }
                 }
                 vec![Effects::OnScore(Arc::new(Mutex::new(apply)))]
@@ -431,7 +431,7 @@ impl JokerEffects for Jokers {
                 fn apply(g: &mut Game, _hand: MadeHand) {
                     for card in g.non_debuffed(_hand.hand.cards().iter()) {
                         if g.is_face_card(&card) {
-                            g.mult *= 2;
+                            g.multiply_mult(2.0);
                             break;
                         }
                     }
@@ -456,7 +456,7 @@ impl JokerEffects for Jokers {
                         .filter(|j| j.rarity() == Rarity::Uncommon)
                         .count();
                     for _ in 0..uncommon {
-                        g.mult = (g.mult as f64 * 1.5) as usize;
+                        g.multiply_mult(1.5);
                     }
                 }
                 vec![Effects::OnScore(Arc::new(Mutex::new(apply)))]
@@ -501,7 +501,7 @@ impl JokerEffects for Jokers {
             Self::Acrobat(_) => {
                 fn apply(g: &mut Game, _hand: MadeHand) {
                     if g.plays == 0 {
-                        g.mult *= 3;
+                        g.multiply_mult(3.0);
                     }
                 }
                 vec![Effects::OnScore(Arc::new(Mutex::new(apply)))]
@@ -520,7 +520,7 @@ impl JokerEffects for Jokers {
                 fn apply(g: &mut Game, _hand: MadeHand) {
                     for card in g.non_debuffed(_hand.hand.cards().iter()) {
                         if card.matches_suit(Suit::Heart) && g.prob_roll(1, 2) {
-                            g.mult += g.mult / 2;
+                            g.multiply_mult(1.5);
                         }
                     }
                 }
@@ -571,7 +571,7 @@ impl JokerEffects for Jokers {
             Self::TheDuo(_) => {
                 fn apply(g: &mut Game, hand: MadeHand) {
                     if hand.hand.is_pair().is_some() {
-                        g.mult *= 2;
+                        g.multiply_mult(2.0);
                     }
                 }
                 vec![Effects::OnScore(Arc::new(Mutex::new(apply)))]
@@ -579,7 +579,7 @@ impl JokerEffects for Jokers {
             Self::TheTrio(_) => {
                 fn apply(g: &mut Game, hand: MadeHand) {
                     if hand.hand.is_three_of_kind().is_some() {
-                        g.mult *= 3;
+                        g.multiply_mult(3.0);
                     }
                 }
                 vec![Effects::OnScore(Arc::new(Mutex::new(apply)))]
@@ -587,7 +587,7 @@ impl JokerEffects for Jokers {
             Self::TheFamily(_) => {
                 fn apply(g: &mut Game, hand: MadeHand) {
                     if hand.hand.is_four_of_kind().is_some() {
-                        g.mult *= 4;
+                        g.multiply_mult(4.0);
                     }
                 }
                 vec![Effects::OnScore(Arc::new(Mutex::new(apply)))]
@@ -595,7 +595,7 @@ impl JokerEffects for Jokers {
             Self::TheOrder(_) => {
                 fn apply(g: &mut Game, hand: MadeHand) {
                     if hand.hand.is_straight().is_some() {
-                        g.mult *= 3;
+                        g.multiply_mult(3.0);
                     }
                 }
                 vec![Effects::OnScore(Arc::new(Mutex::new(apply)))]
@@ -603,7 +603,7 @@ impl JokerEffects for Jokers {
             Self::TheTribe(_) => {
                 fn apply(g: &mut Game, hand: MadeHand) {
                     if hand.hand.is_flush().is_some() {
-                        g.mult *= 2;
+                        g.multiply_mult(2.0);
                     }
                 }
                 vec![Effects::OnScore(Arc::new(Mutex::new(apply)))]
@@ -626,7 +626,7 @@ impl JokerEffects for Jokers {
                         .iter()
                         .filter(|c| c.enhancement == Some(Enhancement::Steel))
                         .count();
-                    g.mult += (g.mult as f64 * 0.2 * count as f64) as usize;
+                    g.add_mult_frac(g.mult_value() * 0.2 * count as f64);
                 }
                 vec![Effects::OnScore(Arc::new(Mutex::new(apply)))]
             }
@@ -651,7 +651,7 @@ impl JokerEffects for Jokers {
                         .filter(|c| c.enhancement.is_some())
                         .count();
                     if enhanced >= 16 {
-                        g.mult *= 3;
+                        g.multiply_mult(3.0);
                     }
                 }
                 vec![Effects::OnScore(Arc::new(Mutex::new(apply)))]
@@ -726,7 +726,7 @@ impl JokerEffects for Jokers {
                     let hands_played = g.config.plays - g.plays;
                     let discards_used = g.config.discards - g.discards_remaining;
                     let delta = hands_played as i64 - discards_used as i64;
-                    g.mult = (g.mult as i64 + delta).max(0) as usize;
+                    g.set_mult_value((g.mult_value() + delta as f64).max(0.0));
                 }
                 vec![Effects::OnScore(Arc::new(Mutex::new(apply)))]
             }
@@ -737,14 +737,14 @@ impl JokerEffects for Jokers {
                         .iter()
                         .filter(|c| c.value == Value::Jack)
                         .count();
-                    g.mult += (g.mult as f64 * 0.5 * jacks as f64) as usize;
+                    g.add_mult_frac(g.mult_value() * 0.5 * jacks as f64);
                 }
                 vec![Effects::OnScore(Arc::new(Mutex::new(apply)))]
             }
             Self::Yorick(_) => {
                 fn apply(g: &mut Game, _hand: MadeHand) {
                     let levels = g.total_cards_discarded / 23;
-                    g.mult += (g.mult as f64 * levels as f64) as usize;
+                    g.add_mult_frac(g.mult_value() * levels as f64);
                 }
                 vec![Effects::OnScore(Arc::new(Mutex::new(apply)))]
             }
@@ -1449,9 +1449,9 @@ mod tests {
         g.buy_joker(j).unwrap();
         g.stage = Stage::Blind(Blind::Small);
 
-        // 2 Steel cards total -> mult += floor(7 * 0.2 * 2) = 7 + 2 = 9
-        // (60 + 44) * 9 = 936
-        assert_eq!(g.calc_score(hand.best_hand().unwrap()), 936);
+        // 2 Steel cards total -> mult 7 + 7 * 0.2 * 2 = 9.8
+        // (60 + 44) * 9.8 = 1019
+        assert_eq!(g.calc_score(hand.best_hand().unwrap()), 1019);
     }
 
     #[test]
@@ -2270,9 +2270,9 @@ mod tests {
         g.buy_joker(j).unwrap();
         g.stage = Stage::Blind(Blind::Small);
 
-        // Baron: 2 kings -> 2 * 1.5 = 3, then 3 * 1.5 = 4 (truncated)
-        // (10 + 22) * (2 * 1.5 * 1.5) = 32 * 4 = 128
-        assert_eq!(g.calc_score(best.clone()), 128);
+        // Baron: 2 kings -> 2 * 1.5 * 1.5 = 4.5
+        // (10 + 22) * 4.5 = 144
+        assert_eq!(g.calc_score(best.clone()), 144);
     }
 
     #[test]
@@ -2585,8 +2585,8 @@ mod tests {
         g.stage = Stage::Blind(Blind::Small);
 
         // BaseballCard: 2 uncommon * X1.5
-        // (10 + 20) * (2 * 1.5 * 1.5) = 30 * 4 = 120
-        assert_eq!(g.calc_score(best.clone()), 120);
+        // (10 + 20) * (2 * 1.5 * 1.5) = 30 * 4.5 = 135
+        assert_eq!(g.calc_score(best.clone()), 135);
     }
 
     #[test]
@@ -3261,7 +3261,7 @@ mod tests {
     #[test]
     fn test_mime_buy_flow_retriggers_held_steel() {
         // Same shape/numbers as test_seal_red_retrigger_steel_held (game.rs):
-        // mult 2 -> 3 (floor(2*1.5)) -> 4 (floor(3*1.5)); score = 30 * 4 = 120
+        // mult 2 -> 3 -> 4.5; score = 30 * 4.5 = 135
         let mut g = Game {
             stage: Stage::Blind(Blind::Small),
             ..Default::default()
@@ -3284,7 +3284,7 @@ mod tests {
         g.stage = Stage::Blind(Blind::Small);
 
         let score = g.calc_score(hand);
-        assert_eq!(score, 120);
+        assert_eq!(score, 135);
     }
 
     #[test]
@@ -3419,11 +3419,11 @@ mod tests {
         g.stage = Stage::Blind(Blind::Small);
 
         // FourOfAKind != most-played (HighCard, 3 plays) -> streak 0 -> 1
-        // (60 + 44) * (7 + (7 * 0.2 * 1) as usize) = 104 * (7 + 1) = 832
-        assert_eq!(g.calc_score(four_of_kind_hand.clone()), 832);
+        // (60 + 44) * (7 + 7 * 0.2 * 1) = 104 * 8.4 = 873
+        assert_eq!(g.calc_score(four_of_kind_hand.clone()), 873);
         // still != most-played (HighCard now leads 3 to 2) -> streak 1 -> 2
-        // (60 + 44) * (7 + (7 * 0.2 * 2) as usize) = 104 * (7 + 2) = 936
-        assert_eq!(g.calc_score(four_of_kind_hand), 936);
+        // (60 + 44) * (7 + 7 * 0.2 * 2) = 104 * 9.8 = 1019
+        assert_eq!(g.calc_score(four_of_kind_hand), 1019);
         // HighCard == most-played (now 4 plays, still highest) -> streak resets
         // (5 + 11) * 1 = 16
         assert_eq!(g.calc_score(high_card_hand), 16);
@@ -3548,11 +3548,11 @@ mod tests {
         assert_eq!(g.calc_score(ace_hand.clone()), 32);
 
         g.discards_remaining -= 1; // 1 discard used
-                         // mult = 1 + (1 - 1) = 1; score = 16
+                                   // mult = 1 + (1 - 1) = 1; score = 16
         assert_eq!(g.calc_score(ace_hand.clone()), 16);
 
         g.discards_remaining -= 1; // 2 discards used
-                         // mult = 1 + (1 - 2) = 0 (floored, not negative); score = 0
+                                   // mult = 1 + (1 - 2) = 0 (floored, not negative); score = 0
         assert_eq!(g.calc_score(ace_hand), 0);
     }
 
@@ -3590,8 +3590,8 @@ mod tests {
         g.select_card(jack1).unwrap();
         g.discard_selected().unwrap();
         // 1 jack discarded (the played jack above doesn't count):
-        // bonus = mult(1) * 0.5 * 1 = 0.5, truncates to 0
-        assert_eq!(g.calc_score(ace_hand.clone()), 16);
+        // bonus = mult(1) * 0.5 * 1 = 0.5; mult = 1.5; score = 16 * 1.5 = 24
+        assert_eq!(g.calc_score(ace_hand.clone()), 24);
 
         let jack2 = Card::new(Value::Jack, Suit::Spade);
         g.available.extend(vec![jack2]);

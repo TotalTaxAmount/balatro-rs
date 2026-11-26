@@ -37,6 +37,40 @@ fn default_reroll_cost() -> usize {
     5
 }
 
+fn default_glass_x_mult() -> f64 {
+    2.0
+}
+
+/// How probabilistic scoring effects resolve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProbMode {
+    /// Roll the RNG as usual.
+    #[default]
+    Sampled,
+    /// Record every probabilistic call site without consuming RNG.
+    Count,
+    /// Consume forced outcomes from `prob_script`.
+    Scripted,
+}
+
+/// Result of evaluating one hypothetical play without mutating the caller.
+#[derive(Debug, Clone)]
+pub struct ScoreEvaluation {
+    /// Expected score across probabilistic effects (exact unless `exact` is
+    /// false, in which case it is a Monte Carlo estimate).
+    pub score: f64,
+    /// Expected money gained during scoring, e.g. Business Card or Gold seals.
+    pub money_delta: f64,
+    pub min_score: usize,
+    pub max_score: usize,
+    /// Number of probabilistic scoring triggers encountered.
+    pub triggers: usize,
+    /// True for the deterministic case and for the exact branch enumeration.
+    pub exact: bool,
+    /// Joker state after the play (counters/selectors), for the next decision.
+    pub jokers_after: Vec<Jokers>,
+}
+
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone)]
 pub struct Game {
@@ -85,8 +119,29 @@ pub struct Game {
     // for scoring
     pub chips: usize,
     pub mult: usize,
+    /// Fractional part of the current mult. Balatro keeps mult as a number
+    /// (e.g. X1.5 on 1 Mult gives 1.5), so scoring must not floor at each
+    /// multiplicative step. `mult` holds the integer part; this holds the
+    /// remainder.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) mult_frac: f64,
+    /// Multiplier applied by a Glass card when scored. Calibrated from the
+    /// client's effect text because the value can differ between versions.
+    #[cfg_attr(feature = "serde", serde(default = "default_glass_x_mult"))]
+    pub glass_x_mult: f64,
     pub score: usize,
     pub prob_mult: u32,
+    /// Transient scoring mode; never persisted.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) prob_mode: ProbMode,
+    /// Probabilistic call sites recorded in `Count` mode.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) prob_trace: Vec<(u32, u32)>,
+    /// Forced outcomes consumed in `Scripted` mode.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) prob_script: Vec<bool>,
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) prob_script_pos: usize,
     /// When set, `required_score` returns this instead of deriving the target
     /// from the ante table. Used when mirroring a live game, where the client
     /// is the authority on the current blind's target.
@@ -193,8 +248,14 @@ impl Game {
             money: config.money_start,
             chips: config.base_chips,
             mult: config.base_mult,
+            mult_frac: 0.0,
+            glass_x_mult: default_glass_x_mult(),
             score: config.base_score,
             prob_mult: 1,
+            prob_mode: ProbMode::Sampled,
+            prob_trace: Vec::new(),
+            prob_script: Vec::new(),
+            prob_script_pos: 0,
             required_score_override: None,
             hand_ranks_played_this_round: HashSet::new(),
             consecutive_hands_without_face_card: 0,
@@ -336,9 +397,19 @@ impl Game {
 
         let planetarium = self.planetarium.clone();
         for card in self.available.not_selected() {
-            if card.seal == Some(Seal::Blue) && self.consumables.len() < self.consumable_slots() {
-                let planet = self.backend.roll_random_planet(&planetarium, &[]);
-                self.consumables.push(planet);
+            let triggers = self.trigger_count_held(&card);
+            // Gold cards pay only when held at the end of the round.
+            if card.enhancement == Some(Enhancement::Gold) {
+                self.money += 3 * triggers;
+            }
+            if card.seal == Some(Seal::Blue) {
+                for _ in 0..triggers {
+                    if self.consumables.len() >= self.consumable_slots() {
+                        break;
+                    }
+                    let planet = self.backend.roll_random_planet(&planetarium, &[]);
+                    self.consumables.push(planet);
+                }
             }
         }
     }
@@ -396,6 +467,26 @@ impl Game {
         self.available.extend(self.deck.draw(count));
     }
 
+    /// Draw cards, reshuffling the discard pile into the deck when the draw
+    /// pile runs out mid-round (real Balatro behavior). If both piles are
+    /// empty, the hand simply stays short.
+    fn draw_with_reshuffle(&mut self, count: usize) {
+        let mut remaining = count;
+        while remaining > 0 {
+            let drawn = self.deck.draw(remaining);
+            let drawn_count = drawn.len();
+            self.available.extend(drawn);
+            remaining -= drawn_count;
+
+            if remaining == 0 || self.discarded.is_empty() {
+                break;
+            }
+
+            self.deck.append(&mut self.discarded);
+            self.backend.shuffle_deck(&mut self.deck);
+        }
+    }
+
     // shuffle and deal new cards to available
     pub(crate) fn deal(&mut self) {
         // add discarded back to deck, emptying in process
@@ -450,7 +541,7 @@ impl Game {
         } else {
             removed
         };
-        self.draw(n);
+        self.draw_with_reshuffle(n);
         for card in scored.hand.cards() {
             if card.enhancement == Some(Enhancement::Glass) && self.prob_roll(1, 4) {
                 self.destroy_card(card.id);
@@ -478,7 +569,7 @@ impl Game {
         } else {
             removed
         };
-        self.draw(n);
+        self.draw_with_reshuffle(n);
 
         // Check for purple seals
         for card in &discarded {
@@ -582,9 +673,196 @@ impl Game {
         all
     }
 
+    /// Current mult including its fractional part.
+    #[inline]
+    pub fn mult_value(&self) -> f64 {
+        self.mult as f64 + self.mult_frac
+    }
+
+    /// Set the full mult value, splitting it into integer and fractional parts.
+    #[inline]
+    pub fn set_mult_value(&mut self, value: f64) {
+        let value = value.max(0.0);
+        self.mult = value.floor() as usize;
+        self.mult_frac = value - self.mult as f64;
+    }
+
+    /// Multiply the full mult value while preserving fractions.
+    #[inline]
+    pub fn multiply_mult(&mut self, factor: f64) {
+        let value = self.mult_value() * factor;
+        self.set_mult_value(value);
+    }
+
+    /// Add to the full mult value while preserving fractions.
+    #[inline]
+    pub fn add_mult_frac(&mut self, add: f64) {
+        let value = self.mult_value() + add;
+        self.set_mult_value(value);
+    }
+
     pub fn prob_roll(&mut self, numerator: u32, denominator: u32) -> bool {
-        self.backend
-            .prob_roll(numerator.saturating_mul(self.prob_mult), denominator)
+        let numerator = numerator.saturating_mul(self.prob_mult);
+        match self.prob_mode {
+            ProbMode::Sampled => self.backend.prob_roll(numerator, denominator),
+            ProbMode::Count => {
+                self.prob_trace.push((numerator, denominator));
+                false
+            }
+            ProbMode::Scripted => {
+                let outcome = self
+                    .prob_script
+                    .get(self.prob_script_pos)
+                    .copied()
+                    .unwrap_or(false);
+                self.prob_script_pos += 1;
+                outcome
+            }
+        }
+    }
+
+    /// Evaluate a hypothetical play without mutating `self`.
+    ///
+    /// The played cards must be cards currently in `available`; the remaining
+    /// hand is treated as held. Probabilistic scoring effects are resolved
+    /// exactly by enumerating their outcomes (up to a cap) and returned as an
+    /// expected score/money, so the search never has to sample to rank plays.
+    ///
+    /// Returns `None` if the selection is not a legal play (empty or more than
+    /// five cards).
+    pub fn calc_score_pure(&self, played: &[Card]) -> Option<ScoreEvaluation> {
+        let made = SelectHand::new(played.to_vec()).best_hand().ok()?;
+
+        let hand_cards = self.available.cards();
+        let selected: HashSet<usize> = played.iter().map(|card| card.id).collect();
+        let available = Available::from_cards(
+            hand_cards
+                .iter()
+                .map(|card| (*card, selected.contains(&card.id)))
+                .collect(),
+        );
+
+        // Pass 1: find every probabilistic scoring call site. Outcomes do not
+        // influence how many call sites are reached.
+        let mut counter = self.clone();
+        counter.available = available.clone();
+        counter.prob_mode = ProbMode::Count;
+        counter.prob_trace.clear();
+        let _ = counter.calc_score(made.clone());
+        let triggers = counter.prob_trace.clone();
+
+        if triggers.is_empty() {
+            let mut game = self.clone();
+            game.available = available;
+            game.prob_mode = ProbMode::Sampled;
+            let score = game.calc_score(made);
+            let money_delta = game.money as i64 - self.money as i64;
+            return Some(ScoreEvaluation {
+                score: score as f64,
+                money_delta: money_delta as f64,
+                min_score: score,
+                max_score: score,
+                triggers: 0,
+                exact: true,
+                jokers_after: game.jokers.clone(),
+            });
+        }
+
+        // Enumerating 2^n outcomes is exact and cheap for realistic trigger
+        // counts. Fall back to Monte Carlo only for pathological states.
+        const MAX_EXACT_TRIGGERS: usize = 12;
+        if triggers.len() <= MAX_EXACT_TRIGGERS {
+            let mut expected_score = 0.0;
+            let mut expected_money = 0.0;
+            let mut min_score = usize::MAX;
+            let mut max_score = 0;
+            let mut jokers_after = self.jokers.clone();
+
+            for mask in 0..(1u64 << triggers.len()) {
+                let mut game = self.clone();
+                game.available = available.clone();
+                game.prob_mode = ProbMode::Scripted;
+                game.prob_script = (0..triggers.len())
+                    .map(|index| (mask >> index) & 1 == 1)
+                    .collect();
+                game.prob_script_pos = 0;
+
+                let score = game.calc_score(made.clone());
+                let money_delta = game.money as i64 - self.money as i64;
+
+                let mut weight = 1.0;
+                for (index, (numerator, denominator)) in triggers.iter().enumerate() {
+                    let probability =
+                        (*numerator).min(*denominator) as f64 / (*denominator).max(1) as f64;
+                    weight *= if (mask >> index) & 1 == 1 {
+                        probability
+                    } else {
+                        1.0 - probability
+                    };
+                }
+
+                expected_score += score as f64 * weight;
+                expected_money += money_delta as f64 * weight;
+                min_score = min_score.min(score);
+                max_score = max_score.max(score);
+                if mask == 0 {
+                    jokers_after = game.jokers.clone();
+                }
+            }
+
+            return Some(ScoreEvaluation {
+                score: expected_score,
+                money_delta: expected_money,
+                min_score,
+                max_score,
+                triggers: triggers.len(),
+                exact: true,
+                jokers_after,
+            });
+        }
+
+        const SAMPLES: usize = 256;
+        let mut rng = rand::thread_rng();
+        let mut total_score = 0.0;
+        let mut total_money = 0.0;
+        let mut min_score = usize::MAX;
+        let mut max_score = 0;
+        let mut jokers_after = self.jokers.clone();
+
+        for sample in 0..SAMPLES {
+            let mut game = self.clone();
+            game.available = available.clone();
+            game.prob_mode = ProbMode::Scripted;
+            game.prob_script = triggers
+                .iter()
+                .map(|(numerator, denominator)| {
+                    let probability =
+                        (*numerator).min(*denominator) as f64 / (*denominator).max(1) as f64;
+                    rng.gen_bool(probability)
+                })
+                .collect();
+            game.prob_script_pos = 0;
+
+            let score = game.calc_score(made.clone());
+            let money_delta = game.money as i64 - self.money as i64;
+            total_score += score as f64;
+            total_money += money_delta as f64;
+            min_score = min_score.min(score);
+            max_score = max_score.max(score);
+            if sample == 0 {
+                jokers_after = game.jokers.clone();
+            }
+        }
+
+        Some(ScoreEvaluation {
+            score: total_score / SAMPLES as f64,
+            money_delta: total_money / SAMPLES as f64,
+            min_score,
+            max_score,
+            triggers: triggers.len(),
+            exact: false,
+            jokers_after,
+        })
     }
 
     pub fn calc_score(&mut self, hand: MadeHand) -> usize {
@@ -621,6 +899,7 @@ impl Game {
             chips_after: self.chips,
             mult_before,
             mult_after: self.mult,
+            mult_frac_after: self.mult_frac,
             retrigger,
         });
     }
@@ -691,7 +970,7 @@ impl Game {
             for _ in 0..matching {
                 let chips_before = self.chips;
                 let mult_before = self.mult;
-                self.mult += self.mult / 2;
+                self.multiply_mult(1.5);
                 self.record_step(
                     &mut trace,
                     ScoreSource::Voucher(Voucher::Observatory),
@@ -730,7 +1009,7 @@ impl Game {
                 match card.enhancement {
                     Some(Enhancement::Bonus) => self.chips += 30,
                     Some(Enhancement::Mult) => self.mult += 4,
-                    Some(Enhancement::Glass) => self.mult *= 2,
+                    Some(Enhancement::Glass) => self.multiply_mult(self.glass_x_mult),
                     Some(Enhancement::Lucky) => {
                         if self.prob_roll(1, 5) {
                             self.mult += 20;
@@ -744,7 +1023,7 @@ impl Game {
                 match card.edition {
                     Edition::Foil => self.chips += 50,
                     Edition::Holographic => self.mult += 10,
-                    Edition::Polychrome => self.mult += self.mult / 2,
+                    Edition::Polychrome => self.multiply_mult(1.5),
                     _ => {}
                 }
                 if card.seal == Some(Seal::Gold) {
@@ -775,6 +1054,15 @@ impl Game {
                     let chips_before = self.chips;
                     let mult_before = self.mult;
                     self.chips += 50;
+                    match card.edition {
+                        Edition::Foil => self.chips += 50,
+                        Edition::Holographic => self.mult += 10,
+                        Edition::Polychrome => self.multiply_mult(1.5),
+                        _ => {}
+                    }
+                    if card.seal == Some(Seal::Gold) {
+                        self.money += 3;
+                    }
                     self.record_step(
                         &mut trace,
                         ScoreSource::StoneKicker(*card),
@@ -802,8 +1090,7 @@ impl Game {
                 let chips_before = self.chips;
                 let mult_before = self.mult;
                 match card.enhancement {
-                    Some(Enhancement::Steel) => self.mult += self.mult / 2,
-                    Some(Enhancement::Gold) => self.money += 3,
+                    Some(Enhancement::Steel) => self.multiply_mult(1.5),
                     _ => {}
                 }
                 self.record_step(
@@ -860,7 +1147,7 @@ impl Game {
             if joker.edition() == Edition::Polychrome {
                 let chips_before = self.chips;
                 let mult_before = self.mult;
-                self.mult += self.mult / 2;
+                self.multiply_mult(1.5);
                 self.record_step(
                     &mut trace,
                     ScoreSource::Joker(joker.clone()),
@@ -875,10 +1162,11 @@ impl Game {
         self.hand_ranks_played_this_round.insert(hand.rank);
 
         // compute score
-        let score = self.chips * self.mult;
+        let score = (self.chips as f64 * self.mult_value()).floor() as usize;
 
         // reset chips and mult
         self.mult = self.config.base_mult;
+        self.mult_frac = 0.0;
         self.chips = self.config.base_chips;
 
         score
@@ -2382,10 +2670,9 @@ mod tests {
     }
 
     #[test]
-    fn test_debuffed_stone_kicker_loses_chip_bonus() {
-        // Same shape as test_enhancement_stone_as_kicker, but the Stone
-        // card is Club-suited under the Club boss - the kicker's +50 chips
-        // no longer apply. (5 + 11) * 1 = 16, not 66.
+    fn test_stone_kicker_not_debuffed_by_suit_boss() {
+        // Stone cards have no suit, so The Club cannot debuff them; the
+        // kicker still scores +50. (5 + 11) + 50 = 66.
         let mut g = Game {
             current_boss: Some(BossBlind::Club),
             blind: Some(Blind::Boss),
@@ -2395,7 +2682,7 @@ mod tests {
         let mut stone = Card::new(Value::Two, Suit::Club);
         stone.enhancement = Some(Enhancement::Stone);
         let hand = SelectHand::new(vec![ace, stone]).best_hand().unwrap();
-        assert_eq!(g.calc_score(hand), 16);
+        assert_eq!(g.calc_score(hand), 66);
     }
 
     #[test]
@@ -3046,7 +3333,7 @@ mod tests {
 
     #[test]
     fn test_enhancement_gold_held() {
-        // Gold card held in unplayed hand gives $3 per hand scored
+        // Gold is paid at the end of the round, not per hand scored.
         let mut g = Game::default();
         let mut gold_card = Card::new(Value::Two, Suit::Heart);
         gold_card.enhancement = Some(Enhancement::Gold);
@@ -3054,7 +3341,69 @@ mod tests {
         let ace = Card::new(Value::Ace, Suit::Spade);
         let hand = SelectHand::new(vec![ace]).best_hand().unwrap();
         g.calc_score(hand);
+        assert_eq!(g.money, 0);
+    }
+
+    #[test]
+    fn test_gold_held_pays_at_round_end() {
+        let mut g = Game::default();
+        let mut gold_card = Card::new(Value::Two, Suit::Heart);
+        gold_card.enhancement = Some(Enhancement::Gold);
+        g.available.extend(vec![gold_card]);
+        g.handle_round_end();
         assert_eq!(g.money, 3);
+    }
+
+    #[test]
+    fn test_gold_held_red_seal_pays_twice_at_round_end() {
+        let mut g = Game::default();
+        let mut gold_card = Card::new(Value::Two, Suit::Heart);
+        gold_card.enhancement = Some(Enhancement::Gold);
+        gold_card.seal = Some(Seal::Red);
+        g.available.extend(vec![gold_card]);
+        g.handle_round_end();
+        assert_eq!(g.money, 6);
+    }
+
+    #[test]
+    fn test_stone_only_scores_high_card_plus_stone_chips() {
+        let mut stone = Card::new(Value::Ten, Suit::Heart);
+        stone.enhancement = Some(Enhancement::Stone);
+        let mut g = Game::default();
+        let hand = SelectHand::new(vec![stone]).best_hand().unwrap();
+        // High Card base 5 chips and the Stone kicker's +50 chips.
+        assert_eq!(g.calc_score(hand), 55);
+    }
+
+    #[test]
+    fn test_stone_kicker_applies_edition_and_gold_seal() {
+        let ace = Card::new(Value::Ace, Suit::Heart);
+        let mut stone = Card::new(Value::Two, Suit::Diamond);
+        stone.enhancement = Some(Enhancement::Stone);
+        stone.edition = Edition::Polychrome;
+        stone.seal = Some(Seal::Gold);
+        let hand = SelectHand::new(vec![ace, stone]).best_hand().unwrap();
+
+        let mut g = Game::default();
+        // (5 + 11 + 50) chips * 1.5 = 99; Gold seal pays $3.
+        assert_eq!(g.calc_score(hand), 99);
+        assert_eq!(g.money, 3);
+    }
+
+    #[test]
+    fn test_draw_with_reshuffle_recycles_discard() {
+        let mut g = Game::default();
+        g.deck = Deck::from_cards(vec![Card::new(Value::Two, Suit::Heart)]);
+        g.discarded = vec![
+            Card::new(Value::Three, Suit::Heart),
+            Card::new(Value::Four, Suit::Heart),
+        ];
+
+        g.draw_with_reshuffle(2);
+
+        assert_eq!(g.available.cards().len(), 2);
+        assert!(g.discarded.is_empty());
+        assert_eq!(g.deck.cards().len(), 1);
     }
 
     #[test]
@@ -3081,8 +3430,7 @@ mod tests {
 
     #[test]
     fn test_seal_red_retrigger_gold_held() {
-        // Red Seal retriggers held-card abilities too, not just played ones:
-        // a held Gold+Red card earns $6 (2x $3), not $3.
+        // Gold+Red held pays at round end (twice), not during scoring.
         let mut g = Game::default();
         let mut gold_red = Card::new(Value::Two, Suit::Heart);
         gold_red.enhancement = Some(Enhancement::Gold);
@@ -3091,6 +3439,8 @@ mod tests {
         let ace = Card::new(Value::Ace, Suit::Spade);
         let hand = SelectHand::new(vec![ace]).best_hand().unwrap();
         g.calc_score(hand);
+        assert_eq!(g.money, 0);
+        g.handle_round_end();
         assert_eq!(g.money, 6);
     }
 
@@ -3098,8 +3448,8 @@ mod tests {
     fn test_seal_red_retrigger_steel_held() {
         // Pair of Kings scored; held Steel+Red King retriggers its Mult bonus twice.
         // Pair level 1: chips=10, mult=2; both Kings score: chips=30
-        // Steel triggers twice: mult = 2 -> 3 (floor(2*1.5)) -> 4 (floor(3*1.5))
-        // score = 30 * 4 = 120
+        // Steel triggers twice: mult 2 -> 3 -> 4.5
+        // score = 30 * 4.5 = 135
         let mut g = Game::default();
         let king1 = Card::new(Value::King, Suit::Heart);
         let king2 = Card::new(Value::King, Suit::Diamond);
@@ -3108,7 +3458,7 @@ mod tests {
         steel_red_king.seal = Some(Seal::Red);
         g.available.extend(vec![steel_red_king]);
         let hand = SelectHand::new(vec![king1, king2]).best_hand().unwrap();
-        assert_eq!(g.calc_score(hand), 120);
+        assert_eq!(g.calc_score(hand), 135);
     }
 
     #[test]
@@ -3239,8 +3589,8 @@ mod tests {
     #[test]
     fn test_mime_retriggers_held_steel() {
         use crate::joker::*;
-        // Same math as test_seal_red_retrigger_steel_held (120), Mime instead of Red Seal:
-        // mult 2 -> 3 (floor(2*1.5)) -> 4 (floor(3*1.5)); score = 30 * 4 = 120
+        // Same math as test_seal_red_retrigger_steel_held (135), Mime instead of Red Seal:
+        // mult 2 -> 3 -> 4.5; score = 30 * 4.5 = 135
         let mut g = Game::default();
         g.jokers.push(Jokers::Mime(Mime::default()));
         let jokers = g.jokers.clone();
@@ -3251,7 +3601,7 @@ mod tests {
         steel_king.enhancement = Some(Enhancement::Steel);
         g.available.extend(vec![steel_king]);
         let hand = SelectHand::new(vec![king1, king2]).best_hand().unwrap();
-        assert_eq!(g.calc_score(hand), 120);
+        assert_eq!(g.calc_score(hand), 135);
     }
 
     #[test]
@@ -3426,9 +3776,9 @@ mod tests {
         g.shop.jokers.push(j.clone());
         g.buy_joker(j).unwrap();
         g.stage = Stage::Blind(Blind::Small);
-        // TheJoker fires (+4 mult), then Polychrome x1.5: floor((1+4)*1.5) = 7
-        // (5+11) * 7 = 112
-        assert_eq!(g.calc_score(hand), 112);
+        // TheJoker fires (+4 mult), then Polychrome x1.5: (1+4)*1.5 = 7.5
+        // (5+11) * 7.5 = 120
+        assert_eq!(g.calc_score(hand), 120);
     }
 
     #[test]
@@ -4619,5 +4969,120 @@ mod tests {
         // Derived, not baked into Config — so no double application.
         assert_eq!(loaded.consumable_slots(), slots);
         assert_eq!(loaded.plays_per_round(), plays);
+    }
+
+    fn single_card_game(card: Card) -> Game {
+        let mut game = Game::default();
+        game.available = Available::from_cards(vec![(card, false)]);
+        game
+    }
+
+    #[test]
+    fn test_calc_score_pure_is_deterministic_and_pure() {
+        let card = Card::new(Value::Ace, Suit::Heart);
+        let game = single_card_game(card);
+
+        let before_money = game.money;
+        let before_plays = game.planetarium.level(HandRank::HighCard).plays;
+
+        let evaluation = game.calc_score_pure(&[card]).expect("legal play");
+
+        assert_eq!(evaluation.triggers, 0);
+        assert!(evaluation.exact);
+        assert_eq!(evaluation.score, 16.0);
+        assert_eq!(evaluation.money_delta, 0.0);
+        // The input game must not have been mutated.
+        assert_eq!(game.money, before_money);
+        assert_eq!(
+            game.planetarium.level(HandRank::HighCard).plays,
+            before_plays
+        );
+    }
+
+    #[test]
+    fn test_calc_score_pure_lucky_is_expected_value() {
+        let mut card = Card::new(Value::Ace, Suit::Heart);
+        card.enhancement = Some(Enhancement::Lucky);
+        let game = single_card_game(card);
+
+        let evaluation = game.calc_score_pure(&[card]).expect("legal play");
+
+        assert_eq!(evaluation.triggers, 2);
+        assert!(evaluation.exact);
+        // High card: (5 + 11) chips, (1 + 0.2 * 20) mult.
+        assert!((evaluation.score - 80.0).abs() < 1e-9);
+        // 1 in 15 chance of $20.
+        assert!((evaluation.money_delta - 20.0 / 15.0).abs() < 1e-9);
+        assert_eq!(evaluation.min_score, 16);
+        assert_eq!(evaluation.max_score, 16 * 21);
+    }
+
+    #[test]
+    fn test_calc_score_pure_business_card_money() {
+        let mut game = Game::default();
+        let joker = Jokers::BusinessCard(crate::joker::BusinessCard::default());
+        game.jokers = vec![joker];
+        game.effect_registry
+            .register_jokers(game.jokers.clone(), &game.clone());
+
+        let card = Card::new(Value::King, Suit::Heart);
+        game.available = Available::from_cards(vec![(card, false)]);
+
+        let evaluation = game.calc_score_pure(&[card]).expect("legal play");
+
+        assert_eq!(evaluation.triggers, 1);
+        assert!(evaluation.exact);
+        assert!((evaluation.money_delta - 1.0).abs() < 1e-9);
+        assert!((evaluation.score - 15.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_glass_x1_5_preserves_fractional_mult() {
+        let mut card = Card::new(Value::King, Suit::Club);
+        card.enhancement = Some(Enhancement::Glass);
+        let mut game = single_card_game(card);
+        game.glass_x_mult = 1.5;
+
+        let evaluation = game.calc_score_pure(&[card]).expect("legal play");
+
+        // (5 + 10) chips * 1.5 mult = 22.5, floored to 22.
+        assert_eq!(evaluation.score, 22.0);
+    }
+
+    #[test]
+    fn test_glass_x2_is_integer_mult() {
+        let mut card = Card::new(Value::King, Suit::Club);
+        card.enhancement = Some(Enhancement::Glass);
+        let game = single_card_game(card);
+
+        let evaluation = game.calc_score_pure(&[card]).expect("legal play");
+
+        assert_eq!(evaluation.score, 30.0);
+    }
+
+    #[test]
+    fn test_polychrome_x1_5_on_one_mult() {
+        let mut card = Card::new(Value::Ace, Suit::Heart);
+        card.edition = Edition::Polychrome;
+        let game = single_card_game(card);
+
+        let evaluation = game.calc_score_pure(&[card]).expect("legal play");
+
+        // (5 + 11) chips * 1.5 mult = 24.
+        assert_eq!(evaluation.score, 24.0);
+    }
+
+    #[test]
+    fn test_glass_and_polychrome_stack_fractionally() {
+        let mut card = Card::new(Value::Ace, Suit::Heart);
+        card.enhancement = Some(Enhancement::Glass);
+        card.edition = Edition::Polychrome;
+        let mut game = single_card_game(card);
+        game.glass_x_mult = 1.5;
+
+        let evaluation = game.calc_score_pure(&[card]).expect("legal play");
+
+        // (5 + 11) chips * 1.5 * 1.5 = 36.
+        assert_eq!(evaluation.score, 36.0);
     }
 }

@@ -27,6 +27,9 @@ pub struct ScoreStep {
     pub chips_after: usize,
     pub mult_before: usize,
     pub mult_after: usize,
+    /// Fractional part of mult after the step (for X1.5 effects).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub mult_frac_after: f64,
     pub retrigger: bool,
 }
 
@@ -37,6 +40,11 @@ impl ScoreStep {
 
     pub fn delta_mult(&self) -> i64 {
         self.mult_after as i64 - self.mult_before as i64
+    }
+
+    /// Full mult after the step, including the fractional part.
+    pub fn mult_value_after(&self) -> f64 {
+        self.mult_after as f64 + self.mult_frac_after
     }
 
     /// Human-readable summary, e.g. "K♠: +10 Chips" or "Mime (retrigger)".
@@ -86,6 +94,7 @@ mod tests {
             chips_after: 10,
             mult_before: 1,
             mult_after: 3,
+            mult_frac_after: 0.0,
             retrigger: false,
         };
         assert_eq!(step.describe(), "TwoPair: +10 Chips, +2 Mult");
@@ -102,6 +111,7 @@ mod tests {
             chips_after: 20,
             mult_before: 2,
             mult_after: 2,
+            mult_frac_after: 0.0,
             retrigger: true,
         };
         assert_eq!(step.describe(), "K♠: +10 Chips (retrigger)");
@@ -118,6 +128,7 @@ mod tests {
             chips_after: 5,
             mult_before: 1,
             mult_after: 1,
+            mult_frac_after: 0.0,
             retrigger: false,
         };
         assert_eq!(step.describe(), "A♥ (held)");
@@ -133,6 +144,7 @@ mod tests {
             chips_after: 9,
             mult_before: 1,
             mult_after: 5,
+            mult_frac_after: 0.0,
             retrigger: false,
         };
         assert_eq!(step.describe(), "Joker: +4 Mult");
