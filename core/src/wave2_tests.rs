@@ -1,5 +1,7 @@
 //! Wave 2 joker coverage tests.
 
+use std::collections::HashSet;
+
 use crate::card::{Card, Enhancement, Suit, Value};
 use crate::effect::GameEvent;
 use crate::game::{Game, ProbMode};
@@ -1028,4 +1030,79 @@ fn green_joker_gains_before_scoring_and_loses_on_discard() {
 
     assert_eq!(score(&mut g, vec![ace]), 32);
     assert_eq!(g.joker_state_mut(1).unwrap().counter, 1.0);
+}
+
+#[test]
+fn two_green_jokers_both_scale() {
+    let mut g = Game::default();
+    add(&mut g, Jokers::GreenJoker(GreenJoker::default()));
+    add(&mut g, Jokers::GreenJoker(GreenJoker::default()));
+    register(&mut g);
+    g.joker_state_mut(1).unwrap().aux = 1.0;
+    g.joker_state_mut(2).unwrap().aux = 1.0;
+
+    let ace = card(Value::Ace, Suit::Heart);
+    // Both gain +1 before scoring and both add +1: 16 * 3 = 48.
+    assert_eq!(score(&mut g, vec![ace]), 48);
+    assert_eq!(g.joker_state_mut(1).unwrap().counter, 1.0);
+    assert_eq!(g.joker_state_mut(2).unwrap().counter, 1.0);
+
+    g.emit(GameEvent::Discard {
+        rank: HandRank::HighCard,
+        discarded: vec![card(Value::Two, Suit::Spade)],
+        first: true,
+    });
+    assert_eq!(g.joker_state_mut(1).unwrap().counter, 0.0);
+    assert_eq!(g.joker_state_mut(2).unwrap().counter, 0.0);
+
+    assert_eq!(score(&mut g, vec![ace]), 48);
+    assert_eq!(g.joker_state_mut(1).unwrap().counter, 1.0);
+    assert_eq!(g.joker_state_mut(2).unwrap().counter, 1.0);
+}
+
+#[test]
+fn invisible_duplicate_preserves_green_state_and_both_scale() {
+    let mut g = Game::default();
+    add(&mut g, Jokers::InvisibleJoker(InvisibleJoker::default()));
+    add(&mut g, Jokers::GreenJoker(GreenJoker::default()));
+    register(&mut g);
+    g.joker_state_mut(1).unwrap().counter = 2.0;
+    g.joker_state_mut(1).unwrap().aux = 2.0;
+    g.joker_state_mut(2).unwrap().counter = 5.0;
+    g.joker_state_mut(2).unwrap().aux = 1.0;
+
+    g.sell_joker(0).expect("sell invisible");
+
+    assert_eq!(g.jokers.len(), 2);
+    assert!(g.jokers.iter().all(|j| j.id() == "j_green_joker"));
+    assert!(g.jokers.iter().all(|j| j.state().counter == 5.0));
+    let ids: HashSet<usize> = g.jokers.iter().map(|j| j.instance_id()).collect();
+    assert_eq!(ids.len(), 2);
+
+    let ace = card(Value::Ace, Suit::Heart);
+    // Both Greens copy 5 -> gain to 6 and add 6: 16 * 13 = 208.
+    assert_eq!(score(&mut g, vec![ace]), 208);
+    assert!(g.jokers.iter().all(|j| j.state().counter == 6.0));
+}
+
+#[test]
+fn two_runner_jokers_both_gain() {
+    let mut g = Game::default();
+    add(&mut g, Jokers::Runner(Runner::default()));
+    add(&mut g, Jokers::Runner(Runner::default()));
+    register(&mut g);
+    g.joker_state_mut(1).unwrap().aux = 15.0;
+    g.joker_state_mut(2).unwrap().aux = 15.0;
+
+    let straight = vec![
+        card(Value::Ace, Suit::Heart),
+        card(Value::King, Suit::Diamond),
+        card(Value::Queen, Suit::Club),
+        card(Value::Jack, Suit::Spade),
+        card(Value::Ten, Suit::Heart),
+    ];
+    // Straight: (30 + 51 + 15 + 15) * 4 = 444.
+    assert_eq!(score(&mut g, straight), 444);
+    assert_eq!(g.joker_state_mut(1).unwrap().counter, 15.0);
+    assert_eq!(g.joker_state_mut(2).unwrap().counter, 15.0);
 }

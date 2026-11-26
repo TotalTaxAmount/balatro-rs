@@ -214,6 +214,7 @@ impl SpectralEffect for Spectral {
                         clone.set_edition(Edition::Base);
                     }
                     game.jokers = vec![original, clone];
+                    game.register_jokers();
                 }
             }
             Self::Hex => {
@@ -221,6 +222,7 @@ impl SpectralEffect for Spectral {
                     let mut original = game.backend.pick_random_joker(game.jokers.clone());
                     original.set_edition(Edition::Polychrome);
                     game.jokers = vec![original];
+                    game.register_jokers();
                 }
             }
         }
@@ -274,7 +276,12 @@ mod tests {
         g.available.extend(vec![card]);
         g.available.select_card(card).unwrap();
         Spectral::Talisman.apply(&mut g).unwrap();
-        let updated = g.available.cards().into_iter().find(|c| c.id == card.id).unwrap();
+        let updated = g
+            .available
+            .cards()
+            .into_iter()
+            .find(|c| c.id == card.id)
+            .unwrap();
         assert_eq!(updated.seal, Some(Seal::Gold));
     }
 
@@ -285,7 +292,12 @@ mod tests {
         g.available.extend(vec![card]);
         g.available.select_card(card).unwrap();
         Spectral::DejaVu.apply(&mut g).unwrap();
-        let updated = g.available.cards().into_iter().find(|c| c.id == card.id).unwrap();
+        let updated = g
+            .available
+            .cards()
+            .into_iter()
+            .find(|c| c.id == card.id)
+            .unwrap();
         assert_eq!(updated.seal, Some(Seal::Red));
     }
 
@@ -296,7 +308,12 @@ mod tests {
         g.available.extend(vec![card]);
         g.available.select_card(card).unwrap();
         Spectral::Trance.apply(&mut g).unwrap();
-        let updated = g.available.cards().into_iter().find(|c| c.id == card.id).unwrap();
+        let updated = g
+            .available
+            .cards()
+            .into_iter()
+            .find(|c| c.id == card.id)
+            .unwrap();
         assert_eq!(updated.seal, Some(Seal::Blue));
     }
 
@@ -307,7 +324,12 @@ mod tests {
         g.available.extend(vec![card]);
         g.available.select_card(card).unwrap();
         Spectral::Medium.apply(&mut g).unwrap();
-        let updated = g.available.cards().into_iter().find(|c| c.id == card.id).unwrap();
+        let updated = g
+            .available
+            .cards()
+            .into_iter()
+            .find(|c| c.id == card.id)
+            .unwrap();
         assert_eq!(updated.seal, Some(Seal::Purple));
     }
 
@@ -320,7 +342,12 @@ mod tests {
             g.available.extend(vec![card]);
             g.available.select_card(card).unwrap();
             Spectral::Aura.apply(&mut g).unwrap();
-            let updated = g.available.cards().into_iter().find(|c| c.id == card.id).unwrap();
+            let updated = g
+                .available
+                .cards()
+                .into_iter()
+                .find(|c| c.id == card.id)
+                .unwrap();
             assert!(matches!(
                 updated.edition,
                 Edition::Foil | Edition::Holographic | Edition::Polychrome
@@ -424,7 +451,8 @@ mod tests {
     #[test]
     fn test_incantation_destroys_one_adds_four_enhanced_numbered_cards() {
         let mut g = game_in_blind();
-        g.available.extend(vec![Card::new(Value::King, Suit::Heart)]);
+        g.available
+            .extend(vec![Card::new(Value::King, Suit::Heart)]);
         Spectral::Incantation.apply(&mut g).unwrap();
         let cards = g.available.cards();
         assert_eq!(cards.len(), 4);
@@ -619,6 +647,32 @@ mod tests {
             .find(|k| k.instance_id() != j.instance_id())
             .unwrap();
         assert_eq!(clone.edition(), Edition::Foil);
+    }
+
+    #[test]
+    fn test_ankh_copy_preserves_scaling_state_and_both_scale() {
+        let mut green = Jokers::GreenJoker(balatro_types::joker::GreenJoker::default());
+        green.set_instance_id(mint_joker_id());
+        let mut state = green.state();
+        state.counter = 5.0;
+        state.aux = 1.0;
+        green.set_state(state);
+
+        let mut g = game_in_blind();
+        g.jokers = vec![green];
+        g.register_jokers();
+
+        Spectral::Ankh.apply(&mut g).unwrap();
+        assert_eq!(g.jokers.len(), 2);
+        assert_ne!(g.jokers[0].instance_id(), g.jokers[1].instance_id());
+        assert!(g.jokers.iter().all(|j| j.state().counter == 5.0));
+
+        let ace = Card::new(Value::Ace, Suit::Heart);
+        let hand = crate::hand::SelectHand::new(vec![ace]).best_hand().unwrap();
+        // Both copies gain +1 before scoring and both add +6:
+        // (5 + 11) * (1 + 6 + 6) = 208.
+        assert_eq!(g.calc_score(hand), 208);
+        assert!(g.jokers.iter().all(|j| j.state().counter == 6.0));
     }
 
     #[test]

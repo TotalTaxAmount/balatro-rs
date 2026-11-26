@@ -855,6 +855,35 @@ mod tests {
     }
 
     #[test]
+    fn test_showman_allows_duplicate_joker_generation() {
+        use rand::SeedableRng;
+        let excluded = Jokers::TheJoker(balatro_types::joker::TheJoker::default());
+        let exclude = vec![excluded.clone()];
+        let mut rng = ChaCha8Rng::seed_from_u64(7);
+
+        let normal = JokerGenerator::new();
+        for _ in 0..500 {
+            let joker = normal.gen_joker_of_rarity(1, &exclude, Rarity::Common, &mut rng);
+            assert_ne!(joker.id(), excluded.id());
+        }
+
+        let mut showman = JokerGenerator::new();
+        showman.showman = true;
+        let mut saw_duplicate = false;
+        for _ in 0..500 {
+            let joker = showman.gen_joker_of_rarity(1, &exclude, Rarity::Common, &mut rng);
+            if joker.id() == excluded.id() {
+                saw_duplicate = true;
+                break;
+            }
+        }
+        assert!(
+            saw_duplicate,
+            "Showman should allow an owned joker to appear"
+        );
+    }
+
+    #[test]
     fn test_gen_edition_playing_cards_never_negative() {
         use rand::SeedableRng;
         let mut rng = ChaCha8Rng::seed_from_u64(42);
