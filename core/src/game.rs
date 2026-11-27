@@ -598,7 +598,7 @@ impl Game {
     /// The boss currently in effect, or `None` if we're not in the middle of
     /// that boss's own round, or its effect is disabled (Chicot held, or
     /// Luchador sold this Boss Blind).
-    pub(crate) fn active_boss(&self) -> Option<BossBlind> {
+    pub fn active_boss(&self) -> Option<BossBlind> {
         if self.blind != Some(Blind::Boss) {
             return None;
         }
