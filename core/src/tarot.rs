@@ -174,7 +174,7 @@ impl TarotEffect for Tarot {
                 if game.jokers.len() < game.joker_slots() {
                     let prob_mult = game.prob_mult;
                     let exclude = game.jokers.clone();
-                    let ante = game.ante_current as i32;
+                    let ante = game.ante_current.as_i32();
                     let joker = game.backend.gen_joker(ante, prob_mult, &exclude);
                     game.jokers.push(joker);
                 }

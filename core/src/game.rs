@@ -159,6 +159,10 @@ pub struct Game {
     // shared game-level history some jokers key off (RideTheBus, Obelisk, etc)
     #[cfg_attr(feature = "serde", serde(default))]
     pub(crate) hand_ranks_played_this_round: HashSet<HandRank>,
+    /// The Eye's own played-type set. Distinct from the global
+    /// `played_this_round` counters when a boss was rerolled mid-round.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub(crate) eye_hands: Option<HashSet<HandRank>>,
     /// Most recent hand rank scored this round, for repeat-aware planning.
     #[cfg_attr(feature = "serde", serde(default))]
     pub(crate) last_hand_rank: Option<HandRank>,
@@ -344,6 +348,7 @@ impl Game {
             range_script_pos: 0,
             required_score_override: None,
             hand_ranks_played_this_round: HashSet::new(),
+            eye_hands: None,
             last_hand_rank: None,
             consecutive_hands_without_face_card: 0,
             consecutive_hands_not_most_played_type: 0,
@@ -536,7 +541,7 @@ impl Game {
             held_jokers,
             vouchers,
             prob_mult: self.prob_mult,
-            ante: self.ante_current as i32,
+            ante: self.ante_current.as_i32(),
             most_played: self.most_played_hand_rank(),
         }
     }
@@ -577,6 +582,7 @@ impl Game {
         self.plays = self.plays_per_round();
         self.discards_remaining = self.discards_per_round();
         self.hand_ranks_played_this_round.clear();
+        self.eye_hands = None;
         self.last_hand_rank = None;
         self.discarded_this_round.clear();
         self.hands_played_this_round = 0;
@@ -605,13 +611,21 @@ impl Game {
         self.current_boss
     }
 
-    /// Whether the active boss zeroes this hand because it is not the type
-    /// The Mouth locked in for the round.
-    pub fn mouth_debuffs(&self, rank: HandRank) -> bool {
-        self.active_boss() == Some(BossBlind::Mouth)
-            && self
+    /// Whether the active boss debuffs this hand type. The Mouth locks the
+    /// round to one type; The Eye forbids repeating any type already played.
+    pub fn hand_debuffs(&self, rank: HandRank) -> bool {
+        let rank = rank.scoring_rank();
+        match self.active_boss() {
+            Some(BossBlind::Mouth) => self
                 .mouth_only_hand
-                .is_some_and(|only| only.scoring_rank() != rank.scoring_rank())
+                .is_some_and(|only| only.scoring_rank() != rank),
+            Some(BossBlind::Eye) => self
+                .eye_hands
+                .as_ref()
+                .unwrap_or(&self.hand_ranks_played_this_round)
+                .contains(&rank),
+            _ => false,
+        }
     }
 
     /// Discards actually usable right now
@@ -935,6 +949,20 @@ impl Game {
     /// Most recent hand rank scored this round.
     pub fn last_hand_rank(&self) -> Option<HandRank> {
         self.last_hand_rank
+    }
+
+    /// Hand types already played this round (normalized for Royal Flush).
+    pub fn hand_ranks_played_this_round(&self) -> &HashSet<HandRank> {
+        &self.hand_ranks_played_this_round
+    }
+
+    /// The Eye's exact played-type set, when the client exposed one.
+    pub fn eye_hands(&self) -> Option<&HashSet<HandRank>> {
+        self.eye_hands.as_ref()
+    }
+
+    pub fn set_eye_hands(&mut self, hands: Option<HashSet<HandRank>>) {
+        self.eye_hands = hands;
     }
 
     /// Money paid by Gold cards held at round end, including Mime and
@@ -1446,14 +1474,17 @@ impl Game {
         self.boss_triggered_this_hand = false;
         self.first_face_id = None;
 
-        // The Mouth debuffs an entire hand whose type differs from the first
-        // hand played this round: no hand level, cards, jokers, or editions
-        // score. The play still counts as a played hand and Matador still
-        // pays out.
-        if self.mouth_debuffs(hand.rank) {
+        // The Mouth and The Eye debuff an entire hand: no hand level, cards,
+        // jokers, or editions score. The play still counts as a played hand
+        // and Matador still pays out.
+        if self.hand_debuffs(hand.rank) {
             self.boss_triggered_this_hand = true;
             self.planetarium.play(hand.rank);
-            self.hand_ranks_played_this_round.insert(hand.rank);
+            self.hand_ranks_played_this_round
+                .insert(hand.rank.scoring_rank());
+            if let Some(eye) = &mut self.eye_hands {
+                eye.insert(hand.rank.scoring_rank());
+            }
             self.last_hand_rank = Some(hand.rank);
             let matadors = self
                 .jokers
@@ -1783,7 +1814,11 @@ impl Game {
         }
 
         // record after joker loop, not before (for CardSharp)
-        self.hand_ranks_played_this_round.insert(hand.rank);
+        self.hand_ranks_played_this_round
+            .insert(hand.rank.scoring_rank());
+        if let Some(eye) = &mut self.eye_hands {
+            eye.insert(hand.rank.scoring_rank());
+        }
         self.last_hand_rank = Some(hand.rank);
 
         // compute score
@@ -1963,7 +1998,7 @@ impl Game {
         let vouchers = self.vouchers.clone();
         self.shop.voucher = self
             .backend
-            .gen_voucher(self.ante_current as i32, &vouchers);
+            .gen_voucher(self.ante_current.as_i32(), &vouchers);
     }
 
     pub(crate) fn reroll(&mut self) -> Result<(), GameError> {
@@ -2477,7 +2512,7 @@ impl Game {
     }
 
     fn draw_ante_boss(&mut self) {
-        self.current_boss = Some(self.backend.draw_boss(self.ante_current as i32));
+        self.current_boss = Some(self.backend.draw_boss(self.ante_current.as_i32()));
     }
 
     pub fn skip_tag(&self, blind: Blind) -> Option<Tag> {
@@ -4014,6 +4049,93 @@ mod tests {
         assert_eq!(g.calc_score(hand), 0);
         assert_eq!(g.money, money_before + 8);
         assert!(g.boss_triggered_this_hand);
+    }
+
+    // --- The Eye: no repeated hand types in a round ---
+
+    fn eye_game() -> Game {
+        let mut g = Game {
+            blind: Some(Blind::Boss),
+            current_boss: Some(BossBlind::Eye),
+            stage: Stage::Blind(Blind::Boss),
+            ..Default::default()
+        };
+        g.required_score_override = Some(1_000_000);
+        g.plays = 4;
+        g
+    }
+
+    #[test]
+    fn test_eye_zeroes_repeated_hand_types() {
+        let mut g = eye_game();
+        let two_pair = card_list(&[
+            (Value::King, Suit::Heart),
+            (Value::King, Suit::Diamond),
+            (Value::Nine, Suit::Club),
+            (Value::Nine, Suit::Spade),
+            (Value::Four, Suit::Heart),
+        ]);
+        set_hand(&mut g, &two_pair);
+        let before = g.score;
+        g.play_selected().expect("first two pair");
+        assert!(g.score > before);
+        assert!(g.hand_ranks_played_this_round.contains(&HandRank::TwoPair));
+
+        let repeated = card_list(&[
+            (Value::Ace, Suit::Heart),
+            (Value::Ace, Suit::Diamond),
+            (Value::Eight, Suit::Club),
+            (Value::Eight, Suit::Spade),
+            (Value::Three, Suit::Heart),
+        ]);
+        set_hand(&mut g, &repeated);
+        let before = g.score;
+        g.play_selected().expect("repeated two pair");
+        assert_eq!(g.score, before);
+        assert!(g.boss_triggered_this_hand);
+
+        // A different type is still allowed.
+        let full_house = card_list(&[
+            (Value::Queen, Suit::Heart),
+            (Value::Queen, Suit::Diamond),
+            (Value::Queen, Suit::Club),
+            (Value::Seven, Suit::Spade),
+            (Value::Seven, Suit::Heart),
+        ]);
+        set_hand(&mut g, &full_house);
+        let before = g.score;
+        g.play_selected().expect("full house");
+        assert!(g.score > before);
+        assert!(g
+            .hand_ranks_played_this_round
+            .contains(&HandRank::FullHouse));
+    }
+
+    #[test]
+    fn test_eye_uses_its_own_hands_set_when_present() {
+        let mut g = eye_game();
+        g.hand_ranks_played_this_round.insert(HandRank::TwoPair);
+        g.set_eye_hands(Some([HandRank::OnePair].into_iter().collect()));
+        assert!(g.hand_debuffs(HandRank::OnePair));
+        assert!(!g.hand_debuffs(HandRank::TwoPair));
+    }
+
+    #[test]
+    fn test_eye_pure_evaluation_zeroes_a_repeated_type() {
+        let mut g = eye_game();
+        g.hand_ranks_played_this_round.insert(HandRank::TwoPair);
+        let repeated = card_list(&[
+            (Value::Ace, Suit::Heart),
+            (Value::Ace, Suit::Diamond),
+            (Value::Eight, Suit::Club),
+            (Value::Eight, Suit::Spade),
+            (Value::Three, Suit::Heart),
+        ]);
+        g.available = Available::from_cards(repeated.iter().map(|card| (*card, false)).collect());
+        let evaluation = g.calc_score_pure(&repeated).expect("legal play");
+        assert_eq!(evaluation.score, 0.0);
+        assert_eq!(evaluation.min_score, 0);
+        assert_eq!(evaluation.max_score, 0);
     }
 
     // --- Group D: delevel by one (Arm) ---
@@ -5819,7 +5941,7 @@ mod tests {
         let boss = g
             .current_boss
             .expect("current_boss redrawn after ante advance");
-        assert_eq!(boss.is_finisher(), g.ante_current as i32 % 8 == 0);
+        assert_eq!(boss.is_finisher(), g.ante_current.as_i32() % 8 == 0);
     }
 
     #[test]

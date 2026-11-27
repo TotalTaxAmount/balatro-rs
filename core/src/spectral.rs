@@ -168,7 +168,7 @@ impl SpectralEffect for Spectral {
             }
             Self::Wraith => {
                 if game.jokers.len() < game.config.joker_slots {
-                    let ante = game.ante_current as i32;
+                    let ante = game.ante_current.as_i32();
                     let exclude = game.jokers.clone();
                     let prob_mult = game.prob_mult;
                     let joker =
@@ -180,7 +180,7 @@ impl SpectralEffect for Spectral {
             }
             Self::Soul => {
                 if game.jokers.len() < game.config.joker_slots {
-                    let ante = game.ante_current as i32;
+                    let ante = game.ante_current.as_i32();
                     let exclude = game.jokers.clone();
                     let prob_mult = game.prob_mult;
                     let joker = game.backend.gen_joker_of_rarity(

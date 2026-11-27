@@ -271,7 +271,9 @@ impl JokerEffects for Jokers {
             }
             Self::CardSharp(_) => {
                 fn apply(g: &mut Game, hand: MadeHand) {
-                    if g.hand_ranks_played_this_round.contains(&hand.rank) {
+                    if g.hand_ranks_played_this_round
+                        .contains(&hand.rank.scoring_rank())
+                    {
                         g.multiply_mult(3.0);
                     }
                 }
@@ -1863,7 +1865,7 @@ impl JokerEffects for Jokers {
                         .map(|j| j.state().aux.max(0.0) as usize)
                         .unwrap_or(2);
                     for _ in 0..count {
-                        let ante = g.ante_current as i32;
+                        let ante = g.ante_current.as_i32();
                         let prob_mult = g.prob_mult;
                         let exclude = g.jokers.clone();
                         let joker = g.backend.gen_joker_of_rarity(

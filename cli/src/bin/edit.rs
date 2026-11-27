@@ -132,7 +132,7 @@ fn main() -> Result<()> {
         Command::SetRerollCost { amount } => game.reroll_cost = amount,
         Command::SetAnte { ante } => {
             game.ante_current = Ante::try_from(ante)
-                .map_err(|_| anyhow::anyhow!("invalid ante: {ante} (must be 0-8)"))?;
+                .map_err(|_| anyhow::anyhow!("invalid ante: {ante} (out of range)"))?;
         }
         Command::SetRound { round } => game.round = round,
         Command::SetPlays { plays } => game.plays = plays,

@@ -286,18 +286,7 @@ fn render_sidebar_button(f: &mut Frame, rect: Rect, label_text: &str) {
 }
 
 fn ante_num(ante: balatro_rs::ante::Ante) -> usize {
-    use balatro_rs::ante::Ante;
-    match ante {
-        Ante::Zero => 0,
-        Ante::One => 1,
-        Ante::Two => 2,
-        Ante::Three => 3,
-        Ante::Four => 4,
-        Ante::Five => 5,
-        Ante::Six => 6,
-        Ante::Seven => 7,
-        Ante::Eight => 8,
-    }
+    ante.as_usize()
 }
 
 pub fn split_sidebar_main(area: Rect) -> (Rect, Rect) {
