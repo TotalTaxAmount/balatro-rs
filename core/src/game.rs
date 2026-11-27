@@ -178,6 +178,10 @@ pub struct Game {
     // set when a boss's ability actually triggered (Matador's trigger condition).
     #[cfg_attr(feature = "serde", serde(default))]
     pub(crate) boss_triggered_this_hand: bool,
+    /// The Mouth locks the round to the first hand type played. `None` until
+    /// the first play; afterwards any other type scores nothing.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub mouth_only_hand: Option<HandRank>,
     /// Cards explicitly debuffed by the client (The Pillar's previously
     /// played cards, modded bosses, etc.), keyed by card id.
     #[cfg_attr(feature = "serde", serde(default))]
@@ -347,6 +351,7 @@ impl Game {
             total_cards_discarded: 0,
             boss_disabled_by_luchador: false,
             boss_triggered_this_hand: false,
+            mouth_only_hand: None,
             debuffed_cards: HashSet::new(),
             total_hands_played: 0,
             hands_played_this_round: 0,
@@ -576,6 +581,7 @@ impl Game {
         self.discarded_this_round.clear();
         self.hands_played_this_round = 0;
         self.boss_disabled_by_luchador = false;
+        self.mouth_only_hand = None;
         self.deck.append(&mut self.discarded);
         self.deck.extend(self.available.cards());
         self.available.empty();
@@ -597,6 +603,15 @@ impl Game {
             return None;
         }
         self.current_boss
+    }
+
+    /// Whether the active boss zeroes this hand because it is not the type
+    /// The Mouth locked in for the round.
+    pub fn mouth_debuffs(&self, rank: HandRank) -> bool {
+        self.active_boss() == Some(BossBlind::Mouth)
+            && self
+                .mouth_only_hand
+                .is_some_and(|only| only.scoring_rank() != rank.scoring_rank())
     }
 
     /// Discards actually usable right now
@@ -682,6 +697,9 @@ impl Game {
         let first_hand = self.hands_played_this_round == 0;
         let selected = SelectHand::new(self.available.selected());
         let best = selected.best_hand_with_rules(self.hand_rules())?;
+        if self.active_boss() == Some(BossBlind::Mouth) && self.mouth_only_hand.is_none() {
+            self.mouth_only_hand = Some(best.rank.scoring_rank());
+        }
         let scored = best.clone();
         let score = self.calc_score(best);
         // The Pillar debuffs cards played earlier in the ante. Record this
@@ -1428,6 +1446,24 @@ impl Game {
         self.boss_triggered_this_hand = false;
         self.first_face_id = None;
 
+        // The Mouth debuffs an entire hand whose type differs from the first
+        // hand played this round: no hand level, cards, jokers, or editions
+        // score. The play still counts as a played hand and Matador still
+        // pays out.
+        if self.mouth_debuffs(hand.rank) {
+            self.boss_triggered_this_hand = true;
+            self.planetarium.play(hand.rank);
+            self.hand_ranks_played_this_round.insert(hand.rank);
+            self.last_hand_rank = Some(hand.rank);
+            let matadors = self
+                .jokers
+                .iter()
+                .filter(|joker| matches!(joker, Jokers::Matador(_)))
+                .count();
+            self.money += 8 * matadors;
+            return 0;
+        }
+
         // Space Joker upgrades the hand before its base chips/mult are read.
         self.emit(GameEvent::BeforeScore(hand.rank));
 
@@ -1718,13 +1754,31 @@ impl Game {
 
         // Seltzer's counter is per-hand and must decrement exactly once even
         // when Blueprint/Brainstorm copy its retrigger effect.
-        for joker in self.jokers.clone() {
-            if matches!(joker, Jokers::Seltzer(_)) {
-                if let Some(state) = self.joker_state_mut(joker.instance_id()) {
-                    if state.counter > 0.0 {
-                        state.counter -= 1.0;
-                    }
+        let seltzers: Vec<usize> = self
+            .jokers
+            .iter()
+            .filter(|joker| matches!(joker, Jokers::Seltzer(_)))
+            .map(|joker| joker.instance_id())
+            .collect();
+        for id in seltzers {
+            let Some(state) = self
+                .jokers
+                .iter()
+                .find(|joker| joker.instance_id() == id)
+                .map(|joker| joker.state())
+            else {
+                continue;
+            };
+            if state.counter - 1.0 <= 0.0 {
+                if let Some(index) = self
+                    .jokers
+                    .iter()
+                    .position(|joker| joker.instance_id() == id)
+                {
+                    self.destroy_joker_at(index);
                 }
+            } else if let Some(slot) = self.joker_state_mut(id) {
+                slot.counter = state.counter - 1.0;
             }
         }
 
@@ -3841,6 +3895,127 @@ mod tests {
         assert_eq!(g.calc_score(hand), 40);
     }
 
+    // --- The Mouth: only the first hand type may be played ---
+
+    fn card_list(cards: &[(Value, Suit)]) -> Vec<Card> {
+        cards
+            .iter()
+            .map(|(value, suit)| Card::new(*value, *suit))
+            .collect()
+    }
+
+    fn mouth_game() -> Game {
+        let mut g = Game {
+            blind: Some(Blind::Boss),
+            current_boss: Some(BossBlind::Mouth),
+            stage: Stage::Blind(Blind::Boss),
+            ..Default::default()
+        };
+        g.required_score_override = Some(1_000_000);
+        g.plays = 4;
+        g
+    }
+
+    fn set_hand(g: &mut Game, cards: &[Card]) {
+        g.available = Available::from_cards(cards.iter().map(|card| (*card, true)).collect());
+        g.deck = Deck::from_cards((0..10).map(|_| Card::new(Value::Two, Suit::Club)).collect());
+    }
+
+    #[test]
+    fn test_mouth_locks_first_hand_type_and_allows_repeats() {
+        let mut g = mouth_game();
+        let pair = card_list(&[
+            (Value::King, Suit::Heart),
+            (Value::King, Suit::Diamond),
+            (Value::Nine, Suit::Club),
+            (Value::Seven, Suit::Spade),
+            (Value::Four, Suit::Heart),
+        ]);
+        set_hand(&mut g, &pair);
+        let before = g.score;
+        g.play_selected().expect("first hand");
+        assert!(g.score > before);
+        assert_eq!(g.mouth_only_hand, Some(HandRank::OnePair));
+        assert!(!g.boss_triggered_this_hand);
+
+        // The same type is allowed and scores again.
+        let pair2 = card_list(&[
+            (Value::Ace, Suit::Club),
+            (Value::Ace, Suit::Spade),
+            (Value::Eight, Suit::Club),
+            (Value::Six, Suit::Diamond),
+            (Value::Three, Suit::Heart),
+        ]);
+        set_hand(&mut g, &pair2);
+        let before = g.score;
+        g.play_selected().expect("repeat hand");
+        assert!(g.score > before);
+        assert_eq!(g.mouth_only_hand, Some(HandRank::OnePair));
+    }
+
+    #[test]
+    fn test_mouth_zeroes_a_different_hand_type() {
+        let mut g = mouth_game();
+        g.mouth_only_hand = Some(HandRank::OnePair);
+        let full_house = card_list(&[
+            (Value::Ace, Suit::Heart),
+            (Value::Ace, Suit::Diamond),
+            (Value::Ace, Suit::Club),
+            (Value::Two, Suit::Spade),
+            (Value::Two, Suit::Heart),
+        ]);
+        set_hand(&mut g, &full_house);
+        let before = g.score;
+        g.play_selected().expect("debuffed hand");
+        assert_eq!(g.score, before);
+        assert!(g.boss_triggered_this_hand);
+        assert_eq!(g.hands_played_this_round, 1);
+        assert!(g
+            .hand_ranks_played_this_round
+            .contains(&HandRank::FullHouse));
+    }
+
+    #[test]
+    fn test_mouth_pure_evaluation_zeroes_disallowed_types() {
+        let mut g = mouth_game();
+        g.mouth_only_hand = Some(HandRank::OnePair);
+        let full_house = card_list(&[
+            (Value::Ace, Suit::Heart),
+            (Value::Ace, Suit::Diamond),
+            (Value::Ace, Suit::Club),
+            (Value::Two, Suit::Spade),
+            (Value::Two, Suit::Heart),
+        ]);
+        g.available = Available::from_cards(full_house.iter().map(|card| (*card, false)).collect());
+        let evaluation = g.calc_score_pure(&full_house).expect("legal play");
+        assert_eq!(evaluation.score, 0.0);
+        assert_eq!(evaluation.min_score, 0);
+        assert_eq!(evaluation.max_score, 0);
+    }
+
+    #[test]
+    fn test_mouth_debuff_pays_matador() {
+        let mut g = mouth_game();
+        g.mouth_only_hand = Some(HandRank::OnePair);
+        let mut matador = crate::joker::Jokers::Matador(crate::joker::Matador::default());
+        matador.set_instance_id(1);
+        g.jokers.push(matador);
+        g.register_jokers();
+        let full_house = card_list(&[
+            (Value::Ace, Suit::Heart),
+            (Value::Ace, Suit::Diamond),
+            (Value::Ace, Suit::Club),
+            (Value::Two, Suit::Spade),
+            (Value::Two, Suit::Heart),
+        ]);
+        g.available = Available::from_cards(full_house.iter().map(|card| (*card, false)).collect());
+        let hand = SelectHand::new(full_house).best_hand().unwrap();
+        let money_before = g.money;
+        assert_eq!(g.calc_score(hand), 0);
+        assert_eq!(g.money, money_before + 8);
+        assert!(g.boss_triggered_this_hand);
+    }
+
     // --- Group D: delevel by one (Arm) ---
 
     #[test]
@@ -4402,8 +4577,9 @@ mod tests {
         // Retrigger while counters remain: (5 + 11 + 11) * 1 = 27.
         assert_eq!(g.calc_score(hand.clone()), 27);
         assert_eq!(g.jokers[0].state().counter, 1.0);
+        // The last hand still retriggers, then Seltzer destroys itself.
         assert_eq!(g.calc_score(hand.clone()), 27);
-        assert_eq!(g.jokers[0].state().counter, 0.0);
+        assert!(g.jokers.is_empty());
         // Exhausted: (5 + 11) * 1 = 16.
         assert_eq!(g.calc_score(hand), 16);
     }

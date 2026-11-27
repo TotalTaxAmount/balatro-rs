@@ -84,6 +84,45 @@ fn turtle_bean_shrinks_at_round_end() {
 }
 
 #[test]
+fn turtle_bean_is_eaten_at_zero_hand_size() {
+    let mut g = Game::default();
+    add(&mut g, Jokers::TurtleBean(TurtleBean::default()));
+    register(&mut g);
+    g.joker_state_mut(1).unwrap().counter = 1.0;
+    g.joker_state_mut(1).unwrap().aux = 1.0;
+    g.emit(GameEvent::RoundEnd);
+    assert!(g.jokers.is_empty());
+    assert_eq!(g.hand_size(), g.config.available);
+}
+
+#[test]
+fn duplicate_turtle_beans_each_decay_once() {
+    let mut g = Game::default();
+    add(&mut g, Jokers::TurtleBean(TurtleBean::default()));
+    add(&mut g, Jokers::TurtleBean(TurtleBean::default()));
+    register(&mut g);
+    for id in [1, 2] {
+        g.joker_state_mut(id).unwrap().counter = 5.0;
+        g.joker_state_mut(id).unwrap().aux = 1.0;
+    }
+    g.emit(GameEvent::RoundEnd);
+    assert_eq!(g.joker_state_mut(1).unwrap().counter, 4.0);
+    assert_eq!(g.joker_state_mut(2).unwrap().counter, 4.0);
+}
+
+#[test]
+fn seltzer_is_destroyed_after_its_last_hand() {
+    let mut g = Game::default();
+    add(&mut g, Jokers::Seltzer(Seltzer::default()));
+    register(&mut g);
+    g.joker_state_mut(1).unwrap().counter = 1.0;
+    let ace = card(Value::Ace, Suit::Heart);
+    // One last retrigger: (5 + 11 * 2) * 1 = 27.
+    assert_eq!(score(&mut g, vec![ace]), 27);
+    assert!(g.jokers.is_empty());
+}
+
+#[test]
 fn oops_doubles_probability_numerators() {
     let mut g = Game::default();
     add(&mut g, Jokers::OopsAllSixes(OopsAllSixes::default()));
@@ -239,6 +278,14 @@ fn ice_cream_uses_current_then_melts() {
     g.joker_state_mut(1).unwrap().aux = 5.0;
     let ace = card(Value::Ace, Suit::Heart);
     assert_eq!(score(&mut g, vec![ace]), 5 + 11 + 100);
+    // The current hand uses the old chips; the melt happens after the hand.
+    assert_eq!(g.joker_state_mut(1).unwrap().counter, 100.0);
+    g.emit(GameEvent::HandPlayed {
+        rank: HandRank::HighCard,
+        played: vec![ace],
+        scored: vec![ace],
+        first: false,
+    });
     assert_eq!(g.joker_state_mut(1).unwrap().counter, 95.0);
 }
 
@@ -366,6 +413,153 @@ fn glass_joker_gains_on_glass_destruction() {
     let ace = card(Value::Ace, Suit::Heart);
     // (5 + 11) * 1.75 = 28.
     assert_eq!(score(&mut g, vec![ace]), 28);
+}
+
+#[test]
+fn wee_joker_gains_on_every_retrigger() {
+    let mut g = Game::default();
+    add(&mut g, Jokers::WeeJoker(WeeJoker::default()));
+    add(&mut g, Jokers::HangingChad(HangingChad::default()));
+    register(&mut g);
+    let two = card(Value::Two, Suit::Heart);
+    g.available = crate::available::Available::from_cards(vec![(two, false)]);
+
+    // High card: 5 base chips + three scored 2s (6 rank chips) + Wee's
+    // 24 chips (8 gained on each of Hanging Chad's three triggers).
+    assert_eq!(score(&mut g, vec![two]), 35);
+    assert_eq!(g.joker_state_mut(1).unwrap().counter, 24.0);
+}
+
+#[test]
+fn raised_fist_uses_the_lowest_held_card_once() {
+    let mut g = Game::default();
+    add(&mut g, Jokers::RaisedFist(RaisedFist::default()));
+    register(&mut g);
+    let king = card(Value::King, Suit::Heart);
+    let two = card(Value::Two, Suit::Heart);
+    g.available = crate::available::Available::from_cards(vec![(king, false), (two, false)]);
+
+    // Held 2 is the lowest: (5 + 10) * (1 + 4) = 75, whichever card is played.
+    assert_eq!(score(&mut g, vec![king]), 75);
+    assert_eq!(score(&mut g, vec![two]), 35);
+}
+
+#[test]
+fn raised_fist_ignores_stone_cards_and_uses_the_last_tie() {
+    let mut g = Game::default();
+    add(&mut g, Jokers::RaisedFist(RaisedFist::default()));
+    register(&mut g);
+    let mut stone = card(Value::Two, Suit::Club);
+    stone.enhancement = Some(Enhancement::Stone);
+    // Two held Kings tie; the later one is chosen but the nominal is the same.
+    let king = card(Value::King, Suit::Heart);
+    let other_king = card(Value::King, Suit::Spade);
+    g.available = crate::available::Available::from_cards(vec![
+        (stone, false),
+        (king, false),
+        (other_king, false),
+    ]);
+
+    // Stone is skipped, held King is the lowest: (5 + 11) * (1 + 20) = 336.
+    assert_eq!(score(&mut g, vec![card(Value::Ace, Suit::Diamond)]), 336);
+}
+
+#[test]
+fn raised_fist_is_blocked_by_a_debuffed_lowest_card() {
+    let mut g = Game::default();
+    add(&mut g, Jokers::RaisedFist(RaisedFist::default()));
+    register(&mut g);
+    let two = card(Value::Two, Suit::Heart);
+    let king = card(Value::King, Suit::Heart);
+    g.debuffed_cards.insert(two.id);
+    g.available = crate::available::Available::from_cards(vec![(two, false), (king, false)]);
+
+    // The debuffed 2 is still the lowest, so the trigger adds no Mult.
+    assert_eq!(score(&mut g, vec![king]), 15);
+}
+
+#[test]
+fn two_joker_stencils_count_themselves_in_the_multiplier() {
+    let mut g = Game::default();
+    add(&mut g, Jokers::JokerStencil(JokerStencil::default()));
+    add(&mut g, Jokers::JokerStencil(JokerStencil::default()));
+    register(&mut g);
+    let ace = card(Value::Ace, Suit::Heart);
+    g.available = crate::available::Available::from_cards(vec![(ace, false)]);
+
+    // Five slots, two Stencils: each is X5, so X25. High card Ace = 16 * 25.
+    assert_eq!(score(&mut g, vec![ace]), 400);
+}
+
+#[test]
+fn joker_stencil_does_nothing_when_every_slot_is_full() {
+    let mut g = Game::default();
+    add(&mut g, Jokers::JokerStencil(JokerStencil::default()));
+    add(&mut g, Jokers::JokerStencil(JokerStencil::default()));
+    add(&mut g, Jokers::Splash(Splash::default()));
+    add(&mut g, Jokers::Splash(Splash::default()));
+    add(&mut g, Jokers::Splash(Splash::default()));
+    register(&mut g);
+    let ace = card(Value::Ace, Suit::Heart);
+    g.available = crate::available::Available::from_cards(vec![(ace, false)]);
+
+    // Five jokers in five slots: the client's empty-slot gate is false.
+    assert_eq!(score(&mut g, vec![ace]), 16);
+}
+
+#[test]
+fn ice_cream_melts_instead_of_staying_at_zero() {
+    let mut g = Game::default();
+    add(&mut g, Jokers::IceCream(IceCream::default()));
+    register(&mut g);
+    g.joker_state_mut(1).unwrap().counter = 10.0;
+    g.joker_state_mut(1).unwrap().aux = 5.0;
+    let event = GameEvent::HandPlayed {
+        rank: HandRank::HighCard,
+        played: vec![],
+        scored: vec![],
+        first: false,
+    };
+    g.emit(event.clone());
+    assert_eq!(g.joker_state_mut(1).unwrap().counter, 5.0);
+
+    g.joker_state_mut(1).unwrap().counter = 5.0;
+    g.emit(event);
+    assert!(g.jokers.is_empty());
+}
+
+#[test]
+fn popcorn_is_eaten_instead_of_staying_at_zero() {
+    let mut g = Game::default();
+    add(&mut g, Jokers::Popcorn(Popcorn::default()));
+    register(&mut g);
+    g.joker_state_mut(1).unwrap().counter = 8.0;
+    g.joker_state_mut(1).unwrap().aux = 4.0;
+    g.emit(GameEvent::RoundEnd);
+    assert_eq!(g.joker_state_mut(1).unwrap().counter, 4.0);
+
+    g.joker_state_mut(1).unwrap().counter = 4.0;
+    g.emit(GameEvent::RoundEnd);
+    assert!(g.jokers.is_empty());
+}
+
+#[test]
+fn ramen_is_eaten_instead_of_staying_at_one_x_mult() {
+    let mut g = Game::default();
+    add(&mut g, Jokers::Ramen(Ramen::default()));
+    register(&mut g);
+    g.joker_state_mut(1).unwrap().counter = 1.02;
+    g.joker_state_mut(1).unwrap().aux = 0.01;
+    let discard = GameEvent::Discard {
+        rank: HandRank::HighCard,
+        discarded: vec![card(Value::Two, Suit::Heart)],
+        first: false,
+    };
+    g.emit(discard.clone());
+    assert!((g.joker_state_mut(1).unwrap().counter - 1.01).abs() < 1e-6);
+
+    g.emit(discard);
+    assert!(g.jokers.is_empty());
 }
 
 #[test]

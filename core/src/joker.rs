@@ -215,10 +215,22 @@ impl JokerEffects for Jokers {
             }
             Self::JokerStencil(_) => {
                 fn apply(g: &mut Game, _hand: MadeHand) {
-                    // Stencil counts its own slot as empty ("Joker Stencil
-                    // included"), so 1 Stencil in 5 slots gives X5.
-                    let empty = g.joker_slots().saturating_sub(g.jokers.len()) + 1;
-                    g.multiply_mult(empty as f64);
+                    // The client computes card_limit - #jokers, then adds one
+                    // for every Joker Stencil. Two Stencils in five slots are
+                    // both X5, not X4. The client only applies the XMult when
+                    // at least one joker slot is empty.
+                    if g.joker_slots() <= g.jokers.len() {
+                        return;
+                    }
+                    let stencils = g
+                        .jokers
+                        .iter()
+                        .filter(|joker| matches!(joker, Jokers::JokerStencil(_)))
+                        .count();
+                    let multiplier = g.joker_slots() - g.jokers.len() + stencils;
+                    if multiplier > 1 {
+                        g.multiply_mult(multiplier as f64);
+                    }
                 }
                 vec![Effects::OnScore(Arc::new(Mutex::new(apply)))]
             }
@@ -287,22 +299,26 @@ impl JokerEffects for Jokers {
             }
             Self::WeeJoker(wee) => {
                 let id = wee.instance_id;
-                let apply = move |g: &mut Game, hand: MadeHand| {
-                    let twos = hand
-                        .scored_cards(g.has_splash())
-                        .iter()
-                        .filter(|c| c.value == Value::Two)
-                        .count();
-                    let counter = match g.joker_state_mut(id) {
-                        Some(state) => {
-                            state.counter += 8.0 * twos as f32;
-                            state.counter
+                let gain = move |g: &mut Game, card: Card| {
+                    if card.value == Value::Two {
+                        if let Some(state) = g.joker_state_mut(id) {
+                            state.counter += 8.0;
                         }
-                        None => return,
-                    };
-                    g.chips += counter as usize;
+                    }
                 };
-                vec![Effects::OnScore(Arc::new(Mutex::new(apply)))]
+                let score = move |g: &mut Game, _hand: MadeHand| {
+                    let counter = g
+                        .jokers
+                        .iter()
+                        .find(|j| j.instance_id() == id)
+                        .map(|j| j.state().counter)
+                        .unwrap_or(0.0);
+                    g.chips += counter.max(0.0) as usize;
+                };
+                vec![
+                    Effects::OnCardScored(Arc::new(Mutex::new(gain))),
+                    Effects::OnScore(Arc::new(Mutex::new(score))),
+                ]
             }
             Self::SpareTrousers(st) => {
                 let id = st.instance_id;
@@ -558,12 +574,29 @@ impl JokerEffects for Jokers {
             }
             Self::RaisedFist(_) => {
                 fn apply(g: &mut Game, _hand: MadeHand) {
-                    // no dedicated numeric "rank" accessor exists; chips() is the
-                    // closest analog to the card's face rank
-                    // TODO: need to do this with rank ord?
-                    let lowest = g.available.not_selected().iter().map(|c| c.chips()).min();
-                    if let Some(lowest) = lowest {
-                        g.mult += lowest * 2;
+                    // The client scans held cards for the last card with the
+                    // lowest base id (Stone excluded), then adds twice its
+                    // nominal when that card's held-in-hand trigger runs.
+                    // Held cards always get one individual trigger per hand.
+                    let mut raised: Option<Card> = None;
+                    let mut lowest_order = u8::MAX;
+                    for candidate in g.available.not_selected() {
+                        if candidate.enhancement == Some(Enhancement::Stone) {
+                            continue;
+                        }
+                        let order = value_rank_order(candidate.value);
+                        if order <= lowest_order {
+                            lowest_order = order;
+                            raised = Some(candidate);
+                        }
+                    }
+                    if let Some(card) = raised {
+                        // A debuffed lowest card uses up the trigger without
+                        // adding Mult.
+                        if g.is_card_debuffed(&card) {
+                            return;
+                        }
+                        g.mult += 2 * value_nominal(card.value);
                     }
                 }
                 vec![Effects::OnScore(Arc::new(Mutex::new(apply)))]
@@ -893,19 +926,27 @@ impl JokerEffects for Jokers {
                 }
                 vec![Effects::OnScore(Arc::new(Mutex::new(apply)))]
             }
-            Self::TurtleBean(_) => {
-                fn apply(g: &mut Game, event: GameEvent) {
+            Self::TurtleBean(bean) => {
+                let id = bean.instance_id;
+                let apply = move |g: &mut Game, event: GameEvent| {
                     if !matches!(event, GameEvent::RoundEnd) {
                         return;
                     }
-                    for joker in g.jokers.clone() {
-                        if matches!(joker, Jokers::TurtleBean(_)) {
-                            if let Some(state) = g.joker_state_mut(joker.instance_id()) {
-                                state.counter = (state.counter - 1.0).max(0.0);
-                            }
-                        }
+                    let Some(state) = g
+                        .jokers
+                        .iter()
+                        .find(|joker| joker.instance_id() == id)
+                        .map(|joker| joker.state())
+                    else {
+                        return;
+                    };
+                    let step = state.aux.max(1.0);
+                    if state.counter - step <= 0.0 {
+                        destroy_joker_instance(g, id);
+                    } else if let Some(slot) = g.joker_state_mut(id) {
+                        slot.counter = state.counter - step;
                     }
-                }
+                };
                 vec![Effects::OnEvent(Arc::new(Mutex::new(apply)))]
             }
             Self::OopsAllSixes(_) => vec![Effects::RuleFlag(RuleFlag::DoubleProb)],
@@ -1025,7 +1066,7 @@ impl JokerEffects for Jokers {
             }
             Self::IceCream(ice) => {
                 let id = ice.instance_id;
-                let apply = move |g: &mut Game, _hand: MadeHand| {
+                let score = move |g: &mut Game, _hand: MadeHand| {
                     let Some(state) = g
                         .jokers
                         .iter()
@@ -1035,11 +1076,30 @@ impl JokerEffects for Jokers {
                         return;
                     };
                     g.chips += state.counter.max(0.0) as usize;
-                    if let Some(slot) = g.joker_state_mut(id) {
-                        slot.counter = (state.counter - state.aux.max(0.0)).max(0.0);
+                };
+                let after = move |g: &mut Game, event: GameEvent| {
+                    if !matches!(event, GameEvent::HandPlayed { .. }) {
+                        return;
+                    }
+                    let Some(state) = g
+                        .jokers
+                        .iter()
+                        .find(|j| j.instance_id() == id)
+                        .map(|j| j.state())
+                    else {
+                        return;
+                    };
+                    let step = state.aux.max(0.0);
+                    if state.counter - step <= 0.0 {
+                        destroy_joker_instance(g, id);
+                    } else if let Some(slot) = g.joker_state_mut(id) {
+                        slot.counter = state.counter - step;
                     }
                 };
-                vec![Effects::OnScore(Arc::new(Mutex::new(apply)))]
+                vec![
+                    Effects::OnScore(Arc::new(Mutex::new(score))),
+                    Effects::OnEvent(Arc::new(Mutex::new(after))),
+                ]
             }
             Self::SquareJoker(square) => {
                 let id = square.instance_id;
@@ -1079,8 +1139,19 @@ impl JokerEffects for Jokers {
                     if !matches!(event, GameEvent::RoundEnd) {
                         return;
                     }
-                    if let Some(state) = g.joker_state_mut(id) {
-                        state.counter = (state.counter - state.aux.max(0.0)).max(0.0);
+                    let Some(state) = g
+                        .jokers
+                        .iter()
+                        .find(|j| j.instance_id() == id)
+                        .map(|j| j.state())
+                    else {
+                        return;
+                    };
+                    let step = state.aux.max(0.0);
+                    if state.counter - step <= 0.0 {
+                        destroy_joker_instance(g, id);
+                    } else if let Some(slot) = g.joker_state_mut(id) {
+                        slot.counter = state.counter - step;
                     }
                 };
                 vec![
@@ -1376,11 +1447,27 @@ impl JokerEffects for Jokers {
                     }
                 };
                 let lose = move |g: &mut Game, event: GameEvent| {
-                    if let GameEvent::Discard { discarded, .. } = event {
-                        if let Some(state) = g.joker_state_mut(id) {
-                            let loss = state.aux.max(0.0) * discarded.len() as f32;
-                            state.counter = (state.counter - loss).max(0.0);
+                    let GameEvent::Discard { discarded, .. } = event else {
+                        return;
+                    };
+                    let Some(mut state) = g
+                        .jokers
+                        .iter()
+                        .find(|j| j.instance_id() == id)
+                        .map(|j| j.state())
+                    else {
+                        return;
+                    };
+                    let step = state.aux.max(0.0);
+                    for _ in 0..discarded.len() {
+                        if state.counter - step <= 1.0 {
+                            destroy_joker_instance(g, id);
+                            return;
                         }
+                        state.counter -= step;
+                    }
+                    if let Some(slot) = g.joker_state_mut(id) {
+                        slot.counter = state.counter.max(0.0);
                     }
                 };
                 vec![
@@ -2212,6 +2299,45 @@ impl JokerEffects for Jokers {
                 | Self::DietCola(_)
                 | Self::Perkeo(_)
         )
+    }
+}
+
+fn destroy_joker_instance(g: &mut Game, id: usize) {
+    if let Some(index) = g.jokers.iter().position(|joker| joker.instance_id() == id) {
+        g.destroy_joker_at(index);
+    }
+}
+
+fn value_rank_order(value: Value) -> u8 {
+    match value {
+        Value::Two => 2,
+        Value::Three => 3,
+        Value::Four => 4,
+        Value::Five => 5,
+        Value::Six => 6,
+        Value::Seven => 7,
+        Value::Eight => 8,
+        Value::Nine => 9,
+        Value::Ten => 10,
+        Value::Jack => 11,
+        Value::Queen => 12,
+        Value::King => 13,
+        Value::Ace => 14,
+    }
+}
+
+fn value_nominal(value: Value) -> usize {
+    match value {
+        Value::Two => 2,
+        Value::Three => 3,
+        Value::Four => 4,
+        Value::Five => 5,
+        Value::Six => 6,
+        Value::Seven => 7,
+        Value::Eight => 8,
+        Value::Nine => 9,
+        Value::Ten | Value::Jack | Value::Queen | Value::King => 10,
+        Value::Ace => 11,
     }
 }
 
@@ -4462,10 +4588,7 @@ mod tests {
         g.buy_joker(j).unwrap();
         g.stage = Stage::Blind(Blind::Small);
 
-        // High card (level 1): 5 chips, 1 mult
-        // Played (1 ace): 11 chips
-        // Lowest held card: Two (2 chips) -> +4 mult
-        // (5 + 11) * (1 + 4) = 80
+        // Lowest held card is the Two: (5 + 11) * (1 + 4) = 80.
         assert_eq!(g.calc_score(hand.best_hand().unwrap()), 80);
     }
 
