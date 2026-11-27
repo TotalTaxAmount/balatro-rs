@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 
 use crate::available::Available;
-use crate::card::{Card, Enhancement, Seal, Suit, Value};
+use crate::card::{Card, Edition, Enhancement, Seal, Suit, Value};
 use crate::effect::GameEvent;
 use crate::game::{Game, ProbMode};
 use crate::hand::SelectHand;
@@ -560,6 +560,26 @@ fn ramen_is_eaten_instead_of_staying_at_one_x_mult() {
 
     g.emit(discard);
     assert!(g.jokers.is_empty());
+}
+
+#[test]
+fn baseball_multiplies_per_uncommon_at_that_jokers_position() {
+    let mut g = Game::default();
+    add(&mut g, Jokers::SockAndBuskin(SockAndBuskin::default()));
+    add(&mut g, Jokers::GoldenTicket(GoldenTicket::default()));
+    add(&mut g, Jokers::Triboulet(Triboulet::default()));
+    let mut baseball = Jokers::BaseballCard(BaseballCard::default());
+    baseball.set_edition(Edition::Holographic);
+    add(&mut g, baseball);
+    register(&mut g);
+
+    let queen = card(Value::Queen, Suit::Club);
+    g.available = Available::from_cards(vec![(queen, false)]);
+    // Q scores twice (Sock), Triboulet X2 twice -> X4, then Baseball X1.5
+    // at Sock (the only Uncommon: Golden Ticket is Common). Baseball's
+    // Holographic +10 resolves at its own position -> X16. Chips are
+    // 5 base + 10 + 10 = 25.
+    assert_eq!(score(&mut g, vec![queen]), 400);
 }
 
 #[test]

@@ -8,7 +8,7 @@ use crate::deck::Deck;
 use crate::effect::{EffectRegistry, Effects, GameEvent, RuleFlag};
 use crate::error::GameError;
 use crate::hand::{HandRules, MadeHand, SelectHand};
-use crate::joker::{joker_display, JokerEffects, JokerState, Jokers};
+use crate::joker::{joker_display, JokerEffects, JokerState, Jokers, Rarity};
 use crate::pack::{OpenPackState, Pack, PackCategory, PackContent};
 use crate::planet::{Planetarium, Planets};
 use crate::rank::HandRank;
@@ -1780,6 +1780,31 @@ impl Game {
                     mult_before,
                     false,
                 );
+            }
+
+            // The client's Joker-on-Joker pass runs after this joker's main
+            // effect: every Baseball Card multiplies Mult by 1.5 for each
+            // Uncommon joker. Applying it here keeps the Baseball's own
+            // edition (which resolves at the Baseball's position) after the
+            // multipliers, matching the live order.
+            let baseballs = self
+                .jokers
+                .iter()
+                .filter(|other| matches!(other, Jokers::BaseballCard(_)))
+                .count();
+            if baseballs > 0 && joker.rarity() == Rarity::Uncommon {
+                for _ in 0..baseballs {
+                    let chips_before = self.chips;
+                    let mult_before = self.mult;
+                    self.multiply_mult(1.5);
+                    self.record_step(
+                        &mut trace,
+                        ScoreSource::Joker(joker.clone()),
+                        chips_before,
+                        mult_before,
+                        false,
+                    );
+                }
             }
         }
 

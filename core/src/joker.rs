@@ -481,17 +481,13 @@ impl JokerEffects for Jokers {
                 vec![Effects::OnScore(Arc::new(Mutex::new(apply)))]
             }
             Self::BaseballCard(_) => {
-                fn apply(g: &mut Game, _hand: MadeHand) {
-                    let uncommon = g
-                        .jokers
-                        .iter()
-                        .filter(|j| j.rarity() == Rarity::Uncommon)
-                        .count();
-                    for _ in 0..uncommon {
-                        g.multiply_mult(1.5);
-                    }
-                }
-                vec![Effects::OnScore(Arc::new(Mutex::new(apply)))]
+                // The client triggers Baseball in the joker-on-joker pass:
+                // for each Uncommon joker being scored, every Baseball Card
+                // multiplies Mult by 1.5 at that joker's position. The
+                // scoring loop in Game::calc_score_inner applies it, so the
+                // Baseball's own edition (e.g. Holographic +10) resolves
+                // later, at the Baseball's position.
+                vec![]
             }
             Self::Bull(_) => {
                 fn apply(g: &mut Game, _hand: MadeHand) {
