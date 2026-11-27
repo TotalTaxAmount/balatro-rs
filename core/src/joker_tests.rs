@@ -369,6 +369,27 @@ fn glass_joker_gains_on_glass_destruction() {
 }
 
 #[test]
+fn xmult_jokers_do_not_apply_below_x2() {
+    for counter in [0.0, 1.0] {
+        let mut g = Game::default();
+        add(&mut g, Jokers::Canio(Canio::default()));
+        register(&mut g);
+        g.joker_state_mut(1).unwrap().counter = counter;
+        let ace = card(Value::Ace, Suit::Heart);
+        g.available = crate::available::Available::from_cards(vec![(ace, false)]);
+        assert_eq!(score(&mut g, vec![ace]), 16, "counter {counter}");
+    }
+
+    let mut g = Game::default();
+    add(&mut g, Jokers::Canio(Canio::default()));
+    register(&mut g);
+    g.joker_state_mut(1).unwrap().counter = 2.0;
+    let ace = card(Value::Ace, Suit::Heart);
+    g.available = crate::available::Available::from_cards(vec![(ace, false)]);
+    assert_eq!(score(&mut g, vec![ace]), 32);
+}
+
+#[test]
 fn canio_gains_on_face_destruction() {
     let mut g = Game::default();
     add(&mut g, Jokers::Canio(Canio::default()));
@@ -822,13 +843,24 @@ fn hiker_adds_permanent_chips_to_scored_cards() {
     g.joker_state_mut(1).unwrap().aux = 5.0;
     let ace = card(Value::Ace, Suit::Heart);
     g.available = crate::available::Available::from_cards(vec![(ace, false)]);
-    g.emit(GameEvent::HandPlayed {
-        rank: HandRank::HighCard,
-        played: vec![ace],
-        scored: vec![ace],
-        first: false,
-    });
+    score(&mut g, vec![ace]);
     assert_eq!(g.available.cards()[0].bonus_chips, 5);
+}
+
+#[test]
+fn hiker_gains_between_retriggers_of_the_same_card() {
+    let mut g = Game::default();
+    add(&mut g, Jokers::Hiker(Hiker::default()));
+    add(&mut g, Jokers::HangingChad(HangingChad::default()));
+    register(&mut g);
+    g.joker_state_mut(1).unwrap().aux = 5.0;
+    let ace = card(Value::Ace, Suit::Heart);
+    g.available = crate::available::Available::from_cards(vec![(ace, false)]);
+
+    // High card: 5 base chips. Hanging Chad scores the Ace three times.
+    // Hiker gains +5 after each trigger, so the retriggers score 11, 16, 21.
+    assert_eq!(score(&mut g, vec![ace]), 5 + 11 + 16 + 21);
+    assert_eq!(g.available.cards()[0].bonus_chips, 15);
 }
 
 #[test]

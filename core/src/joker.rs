@@ -1172,7 +1172,9 @@ impl JokerEffects for Jokers {
                         .find(|j| j.instance_id() == id)
                         .map(|j| j.state())
                     {
-                        g.multiply_mult(state.counter.max(0.0) as f64);
+                        if state.counter > 1.0 {
+                            g.multiply_mult(state.counter as f64);
+                        }
                     }
                 };
                 let gain = move |g: &mut Game, event: GameEvent| {
@@ -1196,7 +1198,9 @@ impl JokerEffects for Jokers {
                         .find(|j| j.instance_id() == id)
                         .map(|j| j.state())
                     {
-                        g.multiply_mult(state.counter.max(0.0) as f64);
+                        if state.counter > 1.0 {
+                            g.multiply_mult(state.counter as f64);
+                        }
                     }
                 };
                 let gain = move |g: &mut Game, event: GameEvent| {
@@ -1265,7 +1269,9 @@ impl JokerEffects for Jokers {
                         .find(|j| j.instance_id() == id)
                         .map(|j| j.state())
                     {
-                        g.multiply_mult(state.counter.max(0.0) as f64);
+                        if state.counter > 1.0 {
+                            g.multiply_mult(state.counter as f64);
+                        }
                     }
                 };
                 vec![
@@ -1282,7 +1288,9 @@ impl JokerEffects for Jokers {
                         .find(|j| j.instance_id() == id)
                         .map(|j| j.state())
                     {
-                        g.multiply_mult(state.counter.max(0.0) as f64);
+                        if state.counter > 1.0 {
+                            g.multiply_mult(state.counter as f64);
+                        }
                     }
                 };
                 let gain = move |g: &mut Game, event: GameEvent| {
@@ -1308,7 +1316,9 @@ impl JokerEffects for Jokers {
                         .find(|j| j.instance_id() == id)
                         .map(|j| j.state())
                     {
-                        g.multiply_mult(state.counter.max(0.0) as f64);
+                        if state.counter > 1.0 {
+                            g.multiply_mult(state.counter as f64);
+                        }
                     }
                 };
                 let gain = move |g: &mut Game, event: GameEvent| {
@@ -1334,7 +1344,9 @@ impl JokerEffects for Jokers {
                         .find(|j| j.instance_id() == id)
                         .map(|j| j.state())
                     {
-                        g.multiply_mult(state.counter.max(0.0) as f64);
+                        if state.counter > 1.0 {
+                            g.multiply_mult(state.counter as f64);
+                        }
                     }
                 };
                 let gain = move |g: &mut Game, event: GameEvent| {
@@ -1358,7 +1370,9 @@ impl JokerEffects for Jokers {
                         .find(|j| j.instance_id() == id)
                         .map(|j| j.state())
                     {
-                        g.multiply_mult(state.counter.max(0.0) as f64);
+                        if state.counter > 1.0 {
+                            g.multiply_mult(state.counter as f64);
+                        }
                     }
                 };
                 let lose = move |g: &mut Game, event: GameEvent| {
@@ -1383,7 +1397,9 @@ impl JokerEffects for Jokers {
                         .find(|j| j.instance_id() == id)
                         .map(|j| j.state())
                     {
-                        g.multiply_mult(state.counter.max(0.0) as f64);
+                        if state.counter > 1.0 {
+                            g.multiply_mult(state.counter as f64);
+                        }
                     }
                 };
                 let change = move |g: &mut Game, event: GameEvent| match event {
@@ -1922,21 +1938,19 @@ impl JokerEffects for Jokers {
             }
             Self::Hiker(hiker) => {
                 let id = hiker.instance_id;
-                let apply = move |g: &mut Game, event: GameEvent| {
-                    let GameEvent::HandPlayed { scored, .. } = event else {
-                        return;
-                    };
+                // Hiker gains permanently per scored-card trigger, not once per
+                // hand. A retrigger of the same card later in the hand sees
+                // the chips gained by the earlier trigger.
+                let apply = move |g: &mut Game, card: Card| {
                     let bonus = g
                         .jokers
                         .iter()
                         .find(|j| j.instance_id() == id)
                         .map(|j| j.state().aux.max(0.0) as i32)
                         .unwrap_or(5);
-                    for card in scored {
-                        g.mutate_card(card.id, |c| c.bonus_chips += bonus);
-                    }
+                    g.mutate_card(card.id, |c| c.bonus_chips += bonus);
                 };
-                vec![Effects::OnEvent(Arc::new(Mutex::new(apply)))]
+                vec![Effects::OnCardScored(Arc::new(Mutex::new(apply)))]
             }
             Self::Madness(madness) => {
                 let id = madness.instance_id;
@@ -1947,7 +1961,9 @@ impl JokerEffects for Jokers {
                         .find(|j| j.instance_id() == id)
                         .map(|j| j.state())
                     {
-                        g.multiply_mult(state.counter.max(0.0) as f64);
+                        if state.counter > 1.0 {
+                            g.multiply_mult(state.counter as f64);
+                        }
                     }
                 };
                 let apply = move |g: &mut Game, event: GameEvent| {

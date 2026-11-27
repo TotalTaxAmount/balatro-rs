@@ -19,7 +19,7 @@ static CARD_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
 // Deserializing a Game doesn't allocate ids, so the counter has no idea
 // which ones are already in use in a loaded save. Call this with the
 // highest id found in the loaded state before minting any new cards.
-pub(crate) fn ensure_id_counter_past(max_seen: usize) {
+pub fn ensure_id_counter_past(max_seen: usize) {
     CARD_ID_COUNTER.fetch_max(max_seen + 1, Ordering::SeqCst);
 }
 

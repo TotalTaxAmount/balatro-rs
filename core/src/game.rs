@@ -178,6 +178,10 @@ pub struct Game {
     // set when a boss's ability actually triggered (Matador's trigger condition).
     #[cfg_attr(feature = "serde", serde(default))]
     pub(crate) boss_triggered_this_hand: bool,
+    /// Cards explicitly debuffed by the client (The Pillar's previously
+    /// played cards, modded bosses, etc.), keyed by card id.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub(crate) debuffed_cards: HashSet<usize>,
 
     // --- Run statistics / lifecycle tracking ---
     #[cfg_attr(feature = "serde", serde(default))]
@@ -343,6 +347,7 @@ impl Game {
             total_cards_discarded: 0,
             boss_disabled_by_luchador: false,
             boss_triggered_this_hand: false,
+            debuffed_cards: HashSet::new(),
             total_hands_played: 0,
             hands_played_this_round: 0,
             skips: 0,
@@ -679,6 +684,13 @@ impl Game {
         let best = selected.best_hand_with_rules(self.hand_rules())?;
         let scored = best.clone();
         let score = self.calc_score(best);
+        // The Pillar debuffs cards played earlier in the ante. Record this
+        // play for subsequent hands; the current hand used the prior set.
+        if self.active_boss() == Some(BossBlind::Pillar) {
+            for card in &scored.all {
+                self.debuffed_cards.insert(card.id);
+            }
+        }
         self.total_hands_played += 1;
         self.hands_played_this_round += 1;
         self.emit(GameEvent::HandPlayed {
@@ -928,6 +940,9 @@ impl Game {
     }
 
     pub fn is_card_debuffed(&self, card: &Card) -> bool {
+        if self.debuffed_cards.contains(&card.id) {
+            return true;
+        }
         match self.active_boss() {
             Some(BossBlind::Club) => self.matches_suit(card, Suit::Club),
             Some(BossBlind::Goad) => self.matches_suit(card, Suit::Spade),
@@ -1231,13 +1246,14 @@ impl Game {
             let mut jokers_after = self.jokers.clone();
 
             for mask in 0..(1u64 << triggers.len()) {
+                let prob_script: Vec<bool> = (0..triggers.len())
+                    .map(|index| (mask >> index) & 1 == 1)
+                    .collect();
                 let mut game = self.clone();
                 game.available = available.clone();
                 game.plays = self.plays.saturating_sub(1);
                 game.prob_mode = ProbMode::Scripted;
-                game.prob_script = (0..triggers.len())
-                    .map(|index| (mask >> index) & 1 == 1)
-                    .collect();
+                game.prob_script = prob_script.clone();
                 game.prob_script_pos = 0;
                 game.range_script = ranges.iter().map(|(min, max)| (min + max) / 2.0).collect();
                 game.range_script_pos = 0;
@@ -1260,6 +1276,28 @@ impl Game {
                 expected_money += money_delta as f64 * weight;
                 min_score = min_score.min(score);
                 max_score = max_score.max(score);
+                // The midpoint pass is right for the EV when uniform ranges
+                // are linear in Mult, but it must not collapse the min/max.
+                // Score the range endpoints with the same probabilistic
+                // branch so a high Misprint/Bloodstone roll is inside the
+                // reported bounds.
+                if !ranges.is_empty() {
+                    let run_range = |values: Vec<f64>| {
+                        let mut game = self.clone();
+                        game.available = available.clone();
+                        game.plays = self.plays.saturating_sub(1);
+                        game.prob_mode = ProbMode::Scripted;
+                        game.prob_script = prob_script.clone();
+                        game.prob_script_pos = 0;
+                        game.range_script = values;
+                        game.range_script_pos = 0;
+                        game.calc_score(made.clone())
+                    };
+                    let low = run_range(ranges.iter().map(|(min, _)| *min).collect());
+                    let high = run_range(ranges.iter().map(|(_, max)| *max).collect());
+                    min_score = min_score.min(low).min(high);
+                    max_score = max_score.max(low).max(high);
+                }
                 if mask == 0 {
                     jokers_after = game.jokers.clone();
                 }
@@ -1480,7 +1518,7 @@ impl Game {
         };
 
         // per-scored-card, rank chips, enhancements, editions
-        for card in scoring_cards {
+        for mut card in scoring_cards {
             if self.is_card_debuffed(&card) {
                 self.boss_triggered_this_hand = true;
                 continue;
@@ -1530,6 +1568,17 @@ impl Game {
                     if let Effects::OnCardScored(f) = e {
                         f.lock().unwrap()(self, card);
                     }
+                    // Hiker mutates the stored card after this trigger.
+                    // Retriggers use a local copy of the card, so refresh the
+                    // permanent chips between triggers.
+                    if let Some(updated) = self
+                        .available
+                        .cards()
+                        .iter()
+                        .find(|stored| stored.id == card.id)
+                    {
+                        card.bonus_chips = updated.bonus_chips;
+                    }
                 }
 
                 self.record_step(
@@ -1547,12 +1596,13 @@ impl Game {
         // still subject to the same retrigger rules as any other played card.
         for card in &hand.all {
             if card.enhancement == Some(Enhancement::Stone) {
-                if self.is_card_debuffed(card) {
+                let mut card = *card;
+                if self.is_card_debuffed(&card) {
                     self.boss_triggered_this_hand = true;
                     continue;
                 }
                 let is_first = Some(card.id) == first_played_id;
-                for trig in 0..self.trigger_count_played(card, is_first) {
+                for trig in 0..self.trigger_count_played(&card, is_first) {
                     let chips_before = self.chips;
                     let mult_before = self.mult;
                     self.chips += 50;
@@ -1565,9 +1615,22 @@ impl Game {
                     if card.seal == Some(Seal::Gold) {
                         self.money += 3;
                     }
+                    for e in self.effect_registry.on_card_scored.clone() {
+                        if let Effects::OnCardScored(f) = e {
+                            f.lock().unwrap()(self, card);
+                        }
+                        if let Some(updated) = self
+                            .available
+                            .cards()
+                            .iter()
+                            .find(|stored| stored.id == card.id)
+                        {
+                            card.bonus_chips = updated.bonus_chips;
+                        }
+                    }
                     self.record_step(
                         &mut trace,
-                        ScoreSource::StoneKicker(*card),
+                        ScoreSource::StoneKicker(card),
                         chips_before,
                         mult_before,
                         trig > 0,
@@ -1707,6 +1770,10 @@ impl Game {
 
     pub fn set_hand_ranks_played_this_round(&mut self, ranks: HashSet<HandRank>) {
         self.hand_ranks_played_this_round = ranks;
+    }
+
+    pub fn set_debuffed_cards(&mut self, ids: HashSet<usize>) {
+        self.debuffed_cards = ids;
     }
 
     pub fn set_consecutive_hands_without_face_card(&mut self, count: usize) {
@@ -1989,6 +2056,7 @@ impl Game {
         if Vouchers::lowers_ante(voucher) {
             if let Some(prev) = self.ante_current.prev() {
                 self.ante_current = prev;
+                self.debuffed_cards.clear();
             }
         }
         // Reroll discounts apply to the shop the player is standing in,
@@ -2413,6 +2481,7 @@ impl Game {
             if let Some(ante_next) = self.ante_current.next(self.ante_end) {
                 self.ante_current = ante_next;
                 self.blind = None;
+                self.debuffed_cards.clear();
                 self.draw_ante_tags();
                 self.draw_ante_boss();
             } else {
@@ -3370,6 +3439,22 @@ mod tests {
         let ten = Card::new(Value::Ten, Suit::Heart);
         let ten_hand = SelectHand::new(vec![ten]).best_hand().unwrap();
         assert_eq!(g.calc_score(ten_hand), 15);
+    }
+
+    #[test]
+    fn test_pillar_debuffs_cards_played_earlier_in_the_ante() {
+        let mut g = Game {
+            current_boss: Some(BossBlind::Pillar),
+            blind: Some(Blind::Boss),
+            stage: Stage::Blind(Blind::Boss),
+            ..Default::default()
+        };
+        g.plays = 4;
+        let ace = Card::new(Value::Ace, Suit::Heart);
+        g.available = Available::from_cards(vec![(ace, false)]);
+        g.apply_live_action(LiveAction::Play(vec![ace.id]))
+            .expect("play");
+        assert!(g.is_card_debuffed(&ace));
     }
 
     #[test]
@@ -6251,6 +6336,27 @@ mod tests {
         assert!((evaluation.money_delta - 20.0 / 15.0).abs() < 1e-9);
         assert_eq!(evaluation.min_score, 16);
         assert_eq!(evaluation.max_score, 16 * 21);
+    }
+
+    #[test]
+    fn test_calc_score_pure_mixed_range_and_trigger_spans_the_range() {
+        let mut card = Card::new(Value::Ace, Suit::Heart);
+        card.enhancement = Some(Enhancement::Lucky);
+        let mut game = single_card_game(card);
+        game.jokers = vec![Jokers::Misprint(crate::joker::Misprint::default())];
+        game.effect_registry
+            .register_jokers(game.jokers.clone(), &game.clone());
+
+        let evaluation = game.calc_score_pure(&[card]).expect("legal play");
+
+        // Lucky's two rolls plus Misprint's uniform mult range.
+        assert_eq!(evaluation.triggers, 3);
+        assert!(evaluation.exact);
+        // High card 16 chips, 1 Mult, plus Lucky's +20 and Misprint's 0..23.
+        assert_eq!(evaluation.min_score, 16);
+        assert!(evaluation.max_score >= 16 * (1 + 20 + 23));
+        assert!(evaluation.score > evaluation.min_score as f64);
+        assert!(evaluation.score < evaluation.max_score as f64);
     }
 
     #[test]
